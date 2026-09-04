@@ -76,6 +76,8 @@ class SWARadixCache:
         self.root = RadixTreeNode(self.key_fn)
         self.root.set_key_value(self.empty, self.empty)
         self.root.ref_count = 1  # root is always protected
+        # Off unless an L3 tier is attached; see RadixCache.enable_page_hash.
+        self.enable_page_hash = False
         self.full_evictable = 0
         self.full_protected = 0
         self.swa_evictable = 0   # tokens of live (non-tombstone), unlocked swa
@@ -232,6 +234,8 @@ class SWARadixCache:
         child = RadixTreeNode(self.key_fn, self._tick())
         child.set_key_value(ids, kv)
         child.set_parent(parent)
+        if self.enable_page_hash:
+            child.chain_hashes_from_parent(ids, self.page_size)
         child.swa_tombstone = tombstone
         self.full_evictable += child.length
         if not tombstone:

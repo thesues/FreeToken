@@ -44,6 +44,18 @@ class RadixTreeNode:
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
 
+        # L3 identity: one chained SHA-256 per WHOLE page of this node's tokens,
+        # or None when page hashing is off. This is a third kind of second
+        # currency, and unlike the two above it CAN be split -- a page hash is
+        # per page, and every `split_at` call site aligns its position down to a
+        # page boundary, so the list divides exactly where the tokens do.
+        #
+        # It exists because the tree's own child key (`_get_key_fn`) is a Python
+        # tuple hash: an in-process dict key, not stable across processes and
+        # not a content digest. A shared storage tier needs a name for a page
+        # that two engines agree on, which is what the chained digest gives.
+        self.hash_value: list[str] | None = None
+
         # these fields should be updated later
         self._key: torch.Tensor
         self._value: torch.Tensor
@@ -78,6 +90,36 @@ class RadixTreeNode:
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
+    def prior_hash(self) -> str | None:
+        """The digest this node's first page chains onto: the last page hash on
+        the path from the root, or None at the start of a sequence.
+
+        Walks up rather than caching, because a node's ancestors change under
+        `split_at` and a cached value would go stale exactly when the tree is
+        being restructured — which is when a wrong prefix identity is hardest
+        to notice.
+        """
+        node = self
+        while not node.is_root():
+            if node.hash_value:
+                return node.hash_value[-1]
+            node = node.parent
+        return None
+
+    def chain_hashes_from_parent(self, token_ids: torch.Tensor, page_size: int) -> None:
+        """Fill `hash_value` for a node whose parent is already attached.
+
+        Explicit rather than hooked into `set_parent`, because `split_at` also
+        calls `set_parent` and there the hashes are divided, not recomputed —
+        a hook would silently overwrite the split with a rehash of the wrong
+        token run.
+        """
+        from freetoken.kvcache.hicache.hashing import chain_page_hashes
+
+        self.hash_value = chain_page_hashes(
+            token_ids.tolist(), page_size, self.parent.prior_hash()
+        )
+
     def get_match_len(self, input_ids: torch.Tensor) -> int:
         from freetoken.kernel import fast_compare_key
 
@@ -99,6 +141,20 @@ class RadixTreeNode:
         new_node.swa_tombstone = self.swa_tombstone
         new_node.swa_uuid = self.swa_uuid
         self.swa_uuid = None
+        if self.hash_value is not None:
+            # Split the digests where the tokens split. `pos` is page-aligned at
+            # every call site -- both radix caches wrap it in
+            # `align_down(..., page_size)` -- so this divides exactly; the
+            # remainder check is here because a future caller that forgot would
+            # otherwise shift every hash after the split by part of a page and
+            # turn correct-looking keys into silent misses.
+            k, rem = divmod(pos * len(self.hash_value), self.length)
+            assert rem == 0, (
+                f"split at {pos} of {self.length} tokens is not page-aligned; "
+                f"cannot divide {len(self.hash_value)} page hashes"
+            )
+            new_node.hash_value = self.hash_value[:k]
+            self.hash_value = self.hash_value[k:]
 
         self.set_key_value(self._key[pos:], self._value[pos:])
         self.set_parent(new_node)
@@ -137,6 +193,9 @@ class RadixPrefixCache(BasePrefixCache):
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
+        # Off unless an L3 tier is attached. The digests cost a SHA-256 per page
+        # on the scheduler thread and buy nothing without a storage tier to name.
+        self.enable_page_hash = False
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
@@ -169,6 +228,8 @@ class RadixPrefixCache(BasePrefixCache):
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
             new_node.set_parent(node)
+            if self.enable_page_hash:
+                new_node.chain_hashes_from_parent(input_ids[prefix_len:], self.page_size)
             self.evictable_size += new_node.length
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
