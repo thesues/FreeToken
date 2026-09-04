@@ -136,6 +136,45 @@ class SWARadixCache:
         kv = torch.cat(value[:best_value_len]) if best_value_len else self.empty
         return SWAMatch(kv, int(kv.numel()), best_node)
 
+    def committed_pages(self, input_ids: torch.Tensor) -> List[Tuple[int, str]]:
+        """`(full page index, page hash)` for each whole page of this prefix, from the TREE.
+
+        Read-only on purpose: no `split_at`, no `_stamp_path`, no truncation to
+        the windowed-reuse boundary. `match_prefix` does all three, which is
+        right for serving a request and wrong for deciding what to persist.
+
+        The tree, not the request's own `page_indices`, because `insert` dedups:
+        a page already in the tree has the request's copy freed and possibly
+        handed to the next allocation, so reading it would persist whatever now
+        lives there. The tree's `value` is the canonical page for those tokens.
+
+        Stops at the first node without hashes rather than guessing — a node
+        inserted while page hashing was off has no identity to store under, and
+        the pages after it are chained onto that missing identity.
+        """
+        out: List[Tuple[int, str]] = []
+        node, pos, total = self.root, 0, len(input_ids)
+        while pos < total:
+            child = node.children.get(self.key_fn(input_ids[pos:]))
+            if child is None:
+                break
+            match_len = align_down(child.get_match_len(input_ids[pos:]), self.page_size)
+            if match_len == 0:
+                break
+            pages = match_len // self.page_size
+            if not child.hash_value:
+                break
+            # A partial match takes the LEADING pages of the node: the tokens
+            # line up from the node's start, so the hashes do too. No split is
+            # needed to read a prefix of either.
+            for k in range(min(pages, len(child.hash_value))):
+                out.append((int(child.value[k * self.page_size].item()),
+                            child.hash_value[k]))
+            if match_len < child.length or len(child.hash_value) < pages:
+                break
+            node, pos = child, pos + match_len
+        return out
+
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
                swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
                ) -> Tuple[int, torch.Tensor]:

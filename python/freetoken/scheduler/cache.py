@@ -56,6 +56,11 @@ class CacheManager:
         if swa_pool is not None:
             self.prefill_chunk_budget = getattr(swa_pool, "prefill_chunk_budget", None)
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
+        # Attached by the engine when an L3 tier is configured; None otherwise,
+        # and every call site below is written so that None costs nothing. The
+        # cache manager does not construct it: the tier needs a storage backend
+        # chosen from server args, and this class has no business resolving one.
+        self.l3_writer = None
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -467,6 +472,16 @@ class CacheManager:
                 req.input_ids[:insert_len], page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
                 update_kv_after_len=old_handle.cached_len)
+        # Persist BEFORE freeing. `insert` dedups, and `freed` holds the request's
+        # copies of pages the tree already had -- once they go back on the free
+        # list the next allocation may own them. The pages read here come from
+        # the TREE (`committed_pages`), so they stay valid either way, but doing
+        # this after the free would mean reading a page whose owner has changed
+        # if that ever stopped being true.
+        if self.l3_writer is not None and insert_len > 0:
+            pages = self.prefix_cache.committed_pages(req.input_ids[:insert_len])
+            if pages:
+                self.l3_writer.submit(pages, tag=req.uid)
         self.unlock(old_handle)
         self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)

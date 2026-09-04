@@ -194,6 +194,30 @@ class Scheduler(SchedulerIOMixin):
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 
+    def _drain_l3_writes(self) -> None:
+        """Collect what the L3 writer finished since the last iteration.
+
+        Failures are counted, not acted on. A prefix that did not reach storage
+        costs exactly one reprefill the next time it is asked for — which is the
+        behaviour of an engine with no L3 tier at all — so there is nothing to
+        recover and nothing worth interrupting the loop over. The counter is what
+        makes a backend that is quietly failing visible instead of just slow.
+        """
+        writer = getattr(self.cache_manager, "l3_writer", None)
+        if writer is None:
+            return
+        for outcome in writer.collect():
+            if outcome.ok:
+                continue
+            self._l3_write_failures = getattr(self, "_l3_write_failures", 0) + 1
+            n = self._l3_write_failures
+            if n in (1, 10, 100) or n % 1000 == 0:
+                logger.warning(
+                    "L3 write did not land for req %s (%d/%d pages%s); %d failures so far",
+                    outcome.tag, outcome.stored, outcome.attempted,
+                    f": {outcome.error}" if outcome.error else "", n,
+                )
+
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
         The main loop of overlapping scheduling and execution.
@@ -213,6 +237,14 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        # Drain the L3 writer's completions here, beside the message drain, for
+        # the same reason: this is the one point in the loop where the scheduler
+        # is holding no cache invariant open. The writer thread never touches the
+        # tree, the pools or the page table — it owns only host bytes handed to
+        # it at submit time — so this is a report, not a synchronisation point,
+        # and a slow backend delays nothing here.
+        self._drain_l3_writes()
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -258,6 +290,14 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        # Drain the L3 writer's completions here, beside the message drain, for
+        # the same reason: this is the one point in the loop where the scheduler
+        # is holding no cache invariant open. The writer thread never touches the
+        # tree, the pools or the page table — it owns only host bytes handed to
+        # it at submit time — so this is a report, not a synchronisation point,
+        # and a slow backend delays nothing here.
+        self._drain_l3_writes()
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
