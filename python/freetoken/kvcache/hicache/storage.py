@@ -11,6 +11,8 @@ Two sglang couplings were cut, nothing else:
   * `sglang.srt.environ.envs`  -> os.environ (one storage-dir override)
   * `HostKVCache` type import  -> TYPE_CHECKING against our own host pool
 """
+from __future__ import annotations
+
 import logging
 import os
 from abc import ABC, abstractmethod
