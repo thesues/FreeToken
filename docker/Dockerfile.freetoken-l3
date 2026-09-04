@@ -1,0 +1,175 @@
+# FreeToken + autumn's L3 KV cache client.
+#
+# A thin layer ON TOP of the production `freetoken-autumn` image, not a fork of
+# it. The base already carries CUDA, torch, FreeToken and oniond; this adds only
+# autumn's PyO3 client and the `autumn_kvcache` adapter, which is what
+# `--hicache-storage-backend dynamic` loads.
+#
+# ── Why a separate file ───────────────────────────────────────────────────────
+# `Dockerfile.freetoken` deliberately took autumn out (2cd7356): the client
+# needs a full rustup + cargo toolchain, ~1.5 GB of it, and nothing in the
+# serving path loaded the adapter. That reasoning still holds for production —
+# so instead of putting it back behind a flag, the L3 build starts from the
+# production image and pays the toolchain only here.
+#
+# Building on the image also fixes what made the last attempts slow. FreeToken
+# still has to be installed from git here — the base carries released 0.1.2 and
+# the L3 tier is not in it — but with `--no-deps --no-build-isolation` against a
+# base that already has torch, instead of build #4's isolated environment that
+# re-downloaded torch for 44 minutes after 59 spent installing it.
+#
+# ── ⚠ This image is back under the WIRE lockstep ──────────────────────────────
+# The production image is free of it; this one is not. It embeds autumn's rkyv
+# client, so AUTUMN_IMAGE MUST name the same commit as the cluster's running
+# autumn-rs. A mismatch does not fail the handshake — it decodes garbage, or
+# fails at the first RPC with a wire-version error. Check before building:
+#
+#   kubectl -n autumn get sts autumn-ps \
+#     -o jsonpath='{.spec.template.spec.containers[0].image}'
+#
+#   docker build -f docker/Dockerfile.freetoken-l3 \
+#     --build-arg FREETOKEN_IMAGE=<cr>/freetoken-autumn:<tag> \
+#     --build-arg AUTUMN_IMAGE=<cr>/autumn-rs:<cluster's commit> \
+#     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
+#     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
+#     -t <cr>/freetoken-l3:<tag> .
+
+# No BASE_REGISTRY here: unlike Dockerfile.freetoken, which prefixes a Docker
+# Hub CUDA image with a pull-through cache, both images below are full paths in
+# our own registry. Prefixing them would name a repository that does not exist.
+ARG FREETOKEN_IMAGE=freetoken-autumn:latest
+ARG AUTUMN_IMAGE=autumn-rs:latest
+
+# Sources only. The binaries stay where they are: `autumn-fuse` still comes out
+# of the autumn-rs image via the pod's initContainer, so the mount is a deploy-
+# time choice here exactly as it is for the production image.
+FROM ${AUTUMN_IMAGE} AS autumncore
+
+FROM ${FREETOKEN_IMAGE}
+
+# ── Mirror knobs (override for China / air-gapped builds) ─────────────────────
+#   RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT : rustup TOOLCHAIN download mirror.
+#   CARGO_MIRROR   : crates.io registry mirror for the wheel build.
+#   PIP_INDEX_URL  : PyPI mirror, for maturin. Use mirrors.aliyun.com, NOT
+#     mirrors.ivolces.com — the ivolces mirror is missing packages this tree
+#     needs and answers `from versions: none` rather than falling back.
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ARG CARGO_MIRROR=
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
+ENV CARGO_HOME=/root/.cargo \
+    PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH \
+    RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+# No apt layer: the base already installs build-essential, pkg-config,
+# libssl-dev, git and curl for its own build, which is everything rustup and
+# maturin need.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+ && python3 -m pip install --no-cache-dir --upgrade "maturin>=1,<2"
+
+# ── FreeToken, from the build context ─────────────────────────────────────────
+# The pipeline's code source IS this repository (thesues/FreeToken@hicache-autumn),
+# so CP clones it with the same machinery that clones every other pipeline and
+# the source arrives as build context. `COPY` is how it gets into the image: a
+# bare `pip install .` would install whatever the container's WORKDIR happens to
+# hold, not the context.
+#
+# Nothing here touches the network, which is what killed every earlier attempt.
+# pip's `git clone` over HTTPS is many round trips against github.com and the CN
+# build pool cannot hold them: three tries in build #9 died at 93 s (GnuTLS recv
+# error -110) and twice at 128 s (connect timeout).
+#
+# This step is also what puts the L3 tier in the image at all. The base carries
+# released FreeToken 0.1.2, and that release has no `freetoken.kvcache.hicache`
+# package — layering autumn's client onto the base is necessary and not
+# sufficient.
+#
+# --no-deps: the base already installed freetoken[accel], so every runtime
+#   dependency is present and resolving them again buys nothing.
+# --no-build-isolation: FreeToken's [build-system] requires torch, and PEP 517
+#   isolation installs it into a fresh environment that cannot see the torch
+#   already here — build #4 spent 44 minutes re-downloading it, and the
+#   extensions would then link against a generic libtorch while the runtime
+#   imports the +cu130 build.
+# --force-reinstall: this branch declares the same `__version__` as the release
+#   already installed (it sits at v0.1.2-22-g…), so pip finds 0.1.2 present,
+#   skips the install and exits 0 having built nothing. The import check below
+#   is what caught that.
+# setuptools <82: torch 2.11.0+cu130 declares it, and a bare `>=77` pulls 84.
+#
+# The extensions are rebuilt deliberately: the 22 commits between v0.1.2 and
+# this branch point touch cpu_moe_ext.cpp, ple_store_ext.cpp and setup.py, so
+# the base image's compiled .so files cannot be paired with this Python.
+COPY . /freetoken-src
+RUN python3 -m pip install --no-cache-dir "setuptools>=77,<82" wheel \
+ && FREETOKEN_ALLOW_CUDA_MISMATCH=0 python3 -m pip install --no-cache-dir \
+      --no-deps --no-build-isolation --force-reinstall /freetoken-src \
+ && python3 -c "import freetoken.kvcache.hicache.storage as s; print('hicache present:', s.__file__)" \
+ && python3 -c "import setuptools, torch; print('setuptools', setuptools.__version__, '/ torch', torch.__version__)" \
+ && rm -rf /freetoken-src
+
+COPY --from=autumncore /usr/local/share/autumn/src/ /src/
+WORKDIR /src
+# REPLACE, never append. The base image already ships a
+# `$CARGO_HOME/config.toml` -- the production build installed rustup and then
+# trimmed `~/.rustup`, which leaves the rustup shims, maturin, and this config
+# behind -- so `>>` lands a SECOND [source.crates-io] table in it and cargo
+# fails with "could not parse TOML configuration" before it reads any manifest.
+#
+# Normally leave CARGO_MIRROR unset: the config already there points at
+# rsproxy's SPARSE index (`sparse+https://rsproxy.cn/index/`), which is faster
+# than the git index this knob would write over it.
+RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
+      printf '[source.crates-io]\nreplace-with="m"\n[source.m]\nregistry="%s"\n' "$CARGO_MIRROR" > "$CARGO_HOME/config.toml"; fi \
+ && echo "--- cargo config in effect ---" && cat "$CARGO_HOME/config.toml" 2>/dev/null || true
+
+# The native `autumn` PyO3 client, then the pure-python adapter package.
+#
+# Compiled here rather than copied as a wheel: the extension has no abi3, so it
+# is bound to the builder's glibc and exact CPython. autumn-rs builds on Debian
+# bookworm (glibc 2.36) and this image is Ubuntu 22.04 (glibc 2.35, Python
+# 3.10) — a wheel from there is either rejected as manylinux_2_36 or installs
+# and dies at import on a missing GLIBC_2.36.
+#
+# `autumn_kvcache` carries `AutumnKVCacheStorage`, the L3 backend FreeToken
+# loads by module path:
+#   --hicache-storage-backend dynamic
+#   --hicache-storage-backend-extra-config '{"module_path":"autumn_kvcache.sglang_backend",
+#     "class_name":"AutumnKVCacheStorage","interface_v1":1,...}'
+# It resolves its HiCacheStorage interface from the host engine, so it binds
+# FreeToken's vendored `freetoken.kvcache.hicache.storage` here — sglang the
+# runtime is not installed and is not needed (autumn-rs ed71f2b; before that
+# commit the adapter bound nothing, and the tier failed silently at construction).
+#
+# `autumn_vllm_loader` is deliberately NOT installed: weights come from the FUSE
+# mount, not from `--load-format autumn`.
+RUN cd python \
+ && maturin build --release --interpreter python3 \
+ && python3 -m pip install --no-cache-dir target/wheels/autumn-*.whl \
+ && python3 -m pip install --no-cache-dir -e autumn_kvcache
+
+# Fail the BUILD, not the first request. `attach_l3` is written so that a tier
+# it cannot construct costs nothing — it logs one line and the engine serves
+# with no L3 — which is right at runtime and useless in a build whose only
+# purpose is to carry that tier. An image that cannot import the adapter, or
+# whose adapter resolved no interface, must not ship.
+# (Written as one `python3 -c` rather than a heredoc: `RUN <<EOF` needs
+# BuildKit's `# syntax=docker/dockerfile:1.4` frontend, which pulls an image the
+# CN build pool may not reach.)
+RUN python3 -c "import autumn_kvcache.sglang_backend as b; \
+assert b._SGLANG_AVAILABLE, 'no HiCacheStorage interface resolved'; \
+assert b._SGLANG_V2_AVAILABLE, 'v2 pool types unresolved: batch_get_v2 would raise'; \
+assert hasattr(b.AutumnKVCacheStorage, 'register_mem_host_pool_v2'), 'ABC default missing: the tier dies at construction'; \
+print('L3 adapter OK, interface from', b.HiCacheStorage.__module__)"
+
+# Trim the Rust toolchain and the build tree; ~1.5 GB and nothing at runtime
+# needs them. `/src/python/autumn_kvcache` stays — it is installed with -e.
+RUN rm -rf /root/.rustup /root/.cargo/registry /src/target /src/python/target
+
+EXPOSE 1919
+CMD ["ft", "--help"]
