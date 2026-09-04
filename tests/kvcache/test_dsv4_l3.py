@@ -16,7 +16,11 @@ from freetoken.kvcache.dsv4_cost_model import dsv4_pool_sizes
 from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
 from freetoken.kvcache.hicache.dsv4_codec import POOL_FULL, POOL_WINDOW
 from freetoken.kvcache.hicache.dsv4_l3 import DSV4L3Tier
-from freetoken.kvcache.hicache.storage import HiCacheStorage, PoolTransferResult
+from freetoken.kvcache.hicache.storage import (
+    HiCacheStorage,
+    PoolHitPolicy,
+    PoolTransferResult,
+)
 from freetoken.models.deepseek_v4.args import DeepseekV4Args
 
 DEVICE = torch.device("cpu")
@@ -27,8 +31,9 @@ RATIOS = (0, 0, 4, 128, 4, 128, 4, 0)
 class FakeStorage(HiCacheStorage):
     """A dict with the v2 surface. `fail_after` makes writes stop landing."""
 
-    def __init__(self, fail_after: int | None = None):
+    def __init__(self, fail_after: int | None = None, window_pages: int = 1):
         self.blobs: dict[str, bytes] = {}
+        self.window_pages = window_pages
         self.fail_after = fail_after
         self.writes = 0
 
@@ -56,16 +61,56 @@ class FakeStorage(HiCacheStorage):
     def batch_set(self, keys, values=None, target_locations=None, target_sizes=None): raise NotImplementedError
     def exists(self, key): return key in self.blobs
 
-    def batch_exists_v2(self, transfers, extra_info=None):
-        res = PoolTransferResult.empty()
+    def batch_get_v2(self, transfers, extra_info=None):
+        out = {}
         for t in transfers:
-            n = 0
-            for key in t.keys:
-                if key in self.blobs:
-                    n += 1
-                else:
-                    break
-            res.update_kv_hit_pages(n)
+            host = self.registered_pools[t.name]
+            oks = []
+            for i, key in enumerate(t.keys):
+                blob = self.blobs.get(key)
+                if blob is None:
+                    oks.append(False)
+                    continue
+                host.set_from_flat_data_page(
+                    int(t.host_indices[i].item()),
+                    torch.frombuffer(bytearray(blob), dtype=torch.uint8),
+                )
+                oks.append(True)
+            out[t.name] = oks
+        return out
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        """The real signature: a primary key list, plus secondary pools.
+
+        `kv_hit_pages` is the minimum across pools. ALL_PAGES needs every page
+        of [0, kv_hit); TRAILING_PAGES needs only the last `len(keys)` of them,
+        which is how a sliding-window tier says "I only cover the tail".
+        """
+        n = 0
+        for key in keys:
+            if key not in self.blobs:
+                break
+            n += 1
+        for t in pool_transfers or []:
+            present = [k in self.blobs for k in t.keys[:n]]
+            if t.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                # Longest suffix of [0, n) that is present.
+                trail = 0
+                for ok in reversed(present):
+                    if not ok:
+                        break
+                    trail += 1
+                # The tail must reach back at least as far as the window does.
+                n = trail if trail < self.window_pages else n
+            else:
+                lead = 0
+                for ok in present:
+                    if not ok:
+                        break
+                    lead += 1
+                n = min(n, lead)
+        res = PoolTransferResult.empty()
+        res.update_kv_hit_pages(n)
         return res
 
 
@@ -211,3 +256,158 @@ def test_writing_nothing_is_not_an_error():
     tier = _tier(pool, FakeStorage())
     rep = tier.write_pages([])
     assert rep.complete and not rep.attempted
+
+
+# --------------------------------------------------------------------------- #
+# read
+# --------------------------------------------------------------------------- #
+def _scramble(pool, seed):
+    g = torch.Generator().manual_seed(seed)
+    for L, r in enumerate(RATIOS):
+        pool.window_pool[L].normal_(generator=g)
+        if r:
+            pool.cmp_pool[L].normal_(generator=g)
+            pool.state_ring[L].buffer.normal_(generator=g)
+            if r == 4:
+                pool.idx_pool[L].normal_(generator=g)
+                pool.indexer_state_ring[L].buffer.normal_(generator=g)
+
+
+def test_a_written_prefix_reads_back_into_the_pool():
+    """The end-to-end contract: what came out of the pool goes back into it.
+
+    Compared through the codec rather than over whole buffers — a page occupies
+    specific rows, and comparing everything would pass on a restore that landed
+    in the wrong place as long as the pool happened to match elsewhere.
+    """
+    pool = _pool()
+    _bind(pool, 2)
+    _scramble(pool, 11)
+    st = FakeStorage()
+    tier = _tier(pool, st)
+    pages = [(0, "h0"), (P, "h1")]
+    assert tier.write_pages(pages).complete
+    before = {
+        (base, name): tier.codec.gather(base, name)
+        for base, _ in pages
+        for name in (POOL_FULL, POOL_WINDOW)
+    }
+
+    _scramble(pool, 22)   # a restart: the pool holds someone else's numbers
+    assert not torch.equal(tier.codec.gather(0, POOL_FULL), before[(0, POOL_FULL)])
+
+    rep = tier.read_pages(pages)
+    assert rep.pages == 2, rep
+    for k, want in before.items():
+        got = tier.codec.gather(*k)
+        assert torch.equal(got, want), f"{k} did not come back byte-identical"
+
+
+def test_nothing_stored_restores_nothing():
+    pool = _pool()
+    _bind(pool, 1)
+    tier = _tier(pool, FakeStorage())
+    assert tier.read_pages([(0, "h0")]).pages == 0
+
+
+def test_the_prefix_stops_at_the_first_missing_page():
+    """Pages are chained. A later page restored over a missing earlier one
+    would leave the pool holding a prefix that never existed."""
+    pool = _pool()
+    _bind(pool, 3)
+    st = FakeStorage()
+    tier = _tier(pool, st)
+    pages = [(0, "h0"), (P, "h1"), (2 * P, "h2")]
+    tier.write_pages(pages)
+    del st.blobs[tier.key(POOL_FULL, "h1")]
+    assert tier.restorable_prefix(pages) == 1
+
+
+def test_a_missing_window_page_at_the_tail_shortens_the_prefix():
+    """The window tier only covers the sliding tail, but that tail is not
+    optional: without it the restored prefix cannot be attended to. The
+    interface folds this into one number, and a wrong fold here would hand the
+    scheduler a prefix it cannot decode from."""
+    pool = _pool()
+    _bind(pool, 3)
+    st = FakeStorage(window_pages=2)
+    tier = _tier(pool, st)
+    pages = [(0, "h0"), (P, "h1"), (2 * P, "h2")]
+    tier.write_pages(pages)
+    assert tier.restorable_prefix(pages) == 3
+    del st.blobs[tier.key(POOL_WINDOW, "h2")]     # the newest window page
+    assert tier.restorable_prefix(pages) < 3
+
+
+def test_a_short_read_claims_no_prefix_at_all():
+    """Half a prefix in the pool is worse than none: the tail would be
+    uninitialised memory the scheduler believes is KV."""
+    pool = _pool()
+    _bind(pool, 2)
+    st = FakeStorage()
+    tier = _tier(pool, st)
+    pages = [(0, "h0"), (P, "h1")]
+    tier.write_pages(pages)
+
+    class HalfRead(FakeStorage):
+        def batch_get_v2(self, transfers, extra_info=None):
+            out = super().batch_get_v2(transfers)
+            for name in out:
+                out[name] = [True] + [False] * (len(out[name]) - 1)
+            return out
+
+    half = HalfRead()
+    half.blobs = st.blobs
+    tier2 = _tier(pool, half)
+    assert tier2.read_pages(pages).pages == 0
+
+
+def test_reading_more_pages_than_staging_slots_works():
+    pool = _pool()
+    _bind(pool, 4)
+    st = FakeStorage()
+    tier = _tier(pool, st, staging_pages=2)
+    pages = [(i * P, f"h{i}") for i in range(4)]
+    tier.write_pages(pages)
+    assert tier.read_pages(pages).pages == 4
+
+
+def test_a_page_that_vanishes_between_the_check_and_the_read_stops_the_prefix():
+    """`exists` and `get` are two round trips, and a backend may evict between
+    them. If the read scattered past that gap, the pool would hold page 2 over
+    an un-restored page 1 — a prefix that never existed, presented to the
+    scheduler as valid history. Stopping at the gap makes it a short read, and
+    a short read claims nothing.
+    """
+    pool = _pool()
+    _bind(pool, 3)
+    st = FakeStorage()
+    tier = _tier(pool, st, staging_pages=4)
+    pages = [(0, "h0"), (P, "h1"), (2 * P, "h2")]
+    tier.write_pages(pages)
+
+    class EvictsMidFlight(FakeStorage):
+        def batch_get_v2(self, transfers, extra_info=None):
+            # The middle page is gone by the time the read lands, although the
+            # existence check a moment earlier reported the whole prefix.
+            for t in transfers:
+                self.blobs.pop(t.keys[1], None)
+            return super().batch_get_v2(transfers)
+
+    racy = EvictsMidFlight()
+    racy.blobs = dict(st.blobs)
+    tier2 = _tier(pool, racy, staging_pages=4)
+    assert tier2.restorable_prefix(pages) == 3, "the check sees a whole prefix"
+
+    # Scramble so a scatter is visible, and record what page 2 must keep.
+    _scramble(pool, 33)
+    untouched = tier2.codec.gather(2 * P, POOL_FULL)
+
+    assert tier2.read_pages(pages).pages == 0, "the read must not claim it"
+    # The report alone cannot distinguish stopping at the gap from carrying on
+    # past it — both end up claiming nothing. The pool can: carrying on writes
+    # page 2 over an un-restored page 1, leaving rows that belong to a prefix
+    # that was never assembled.
+    assert torch.equal(tier2.codec.gather(2 * P, POOL_FULL), untouched), (
+        "page 2 was scattered in despite page 1 being missing"
+    )

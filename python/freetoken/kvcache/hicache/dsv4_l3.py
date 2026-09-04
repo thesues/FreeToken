@@ -40,6 +40,24 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ReadReport:
+    """How much of the candidate prefix came back, and from where.
+
+    `pages` is the answer the scheduler acts on: the number of LEADING pages now
+    restored in the device pool. Anything past it must be prefilled. It is never
+    optimistic — a page counted here has both tiers it needs already scattered
+    in.
+    """
+
+    pages: int = 0
+    loaded: dict[str, int] = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        detail = ", ".join(f"{p}: {n}" for p, n in self.loaded.items())
+        return f"{self.pages} pages restored ({detail})" if detail else "nothing restored"
+
+
+@dataclass
 class WriteReport:
     """What actually landed. Never a bare success flag.
 
@@ -193,17 +211,17 @@ class DSV4L3Tier:
         cannot be filled by writing the tail — a later reader stops at the gap
         regardless.
         """
+        # One pool at a time, as the PRIMARY key list. The combined form —
+        # full as primary with window as a trailing secondary — returns the
+        # minimum across pools, which is the right question when READING and
+        # the wrong one here: it would under-report what is already stored and
+        # make every write redo pages that are present.
+        #
+        # `todo` for the window pool is already the resident suffix, so a
+        # leading count over that list means what it says.
         keys = [self.key(pool_name, h) for _, h in todo]
-        transfer = PoolTransfer(
-            name=pool_name,
-            keys=keys,
-            hit_policy=(
-                PoolHitPolicy.ALL_PAGES if pool_name == POOL_FULL
-                else PoolHitPolicy.TRAILING_PAGES
-            ),
-        )
         try:
-            result = self.storage.batch_exists_v2([transfer])
+            result = self.storage.batch_exists_v2(keys)
         except NotImplementedError:
             return 0
         return int(getattr(result, "kv_hit_pages", 0) or 0)
@@ -231,6 +249,109 @@ class DSV4L3Tier:
             )
             results = self.storage.batch_set_v2([transfer])
             return sum(1 for ok in results.get(pool_name, []) if ok)
+        finally:
+            host.free(slots)
+
+
+    # ----- read ------------------------------------------------------------ #
+
+    def restorable_prefix(self, pages: list[tuple[int, str]]) -> int:
+        """How many LEADING pages of this candidate the backend can supply.
+
+        The two tiers are asked as one question, because the answer is one
+        number and the interface already computes it: the full tier is the
+        primary key list — every page of a usable prefix needs its history — and
+        the window tier rides along as a secondary pool with TRAILING_PAGES,
+        since only the sliding tail needs window rows. `kv_hit_pages` comes back
+        as the minimum across pools, so a missing window page at the tail
+        shortens the prefix rather than being silently ignored.
+
+        Asking the two separately and taking a minimum here would be the same
+        arithmetic done worse: it would not know how many trailing pages the
+        window actually has to cover, which depends on the window size the
+        backend was told about, not on anything visible from this side.
+        """
+        if not pages:
+            return 0
+        full_keys = [self.key(POOL_FULL, h) for _, h in pages]
+        window = PoolTransfer(
+            name=POOL_WINDOW,
+            keys=[self.key(POOL_WINDOW, h) for _, h in pages],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        try:
+            result = self.storage.batch_exists_v2(full_keys, [window])
+        except NotImplementedError:
+            return 0
+        return min(int(getattr(result, "kv_hit_pages", 0) or 0), len(pages))
+
+    def read_pages(self, pages: list[tuple[int, str]]) -> ReadReport:
+        """Restore a prefix into the device pool.
+
+        `pages` are `(full_page_base, page_hash)` for pages the caller has
+        ALREADY allocated — window pages included, and bound, because a window
+        blob has nowhere to land otherwise. Returns how many leading pages are
+        now genuinely in the pool.
+        """
+        report = ReadReport()
+        n = self.restorable_prefix(pages)
+        if n == 0:
+            return report
+        want = pages[:n]
+
+        for pool_name in (POOL_FULL, POOL_WINDOW):
+            subset = (
+                want if pool_name == POOL_FULL
+                else [p for p in want if self.codec.window_resident(p[0])]
+            )
+            if not subset:
+                continue
+            got = 0
+            for chunk in _chunks(subset, self.staging_pages):
+                got += self._read_chunk(pool_name, chunk)
+            report.loaded[pool_name] = got
+            if got != len(subset):
+                # A short read means the prefix this report describes is not
+                # actually in the pool. Reporting the requested length would
+                # hand the scheduler a prefix whose tail is uninitialised
+                # memory — worse than reprefilling, because it is wrong rather
+                # than slow.
+                logger.warning(
+                    "DSV4 L3 read short on %s: %d of %d pages; not claiming the prefix",
+                    pool_name, got, len(subset),
+                )
+                return ReadReport(pages=0, loaded=report.loaded)
+        report.pages = n
+        return report
+
+    def _read_chunk(self, pool_name: str, chunk: list[tuple[int, str]]) -> int:
+        host = self.staging[pool_name]
+        slots = host.alloc(len(chunk) * self.pool.P)
+        if slots is None:
+            raise RuntimeError(
+                f"{pool_name}: staging pool could not supply {len(chunk)} pages; "
+                "a previous transfer leaked its allocation."
+            )
+        try:
+            host_indices = slots[:: self.pool.P].contiguous()
+            transfer = PoolTransfer(
+                name=pool_name,
+                host_indices=host_indices,
+                keys=[self.key(pool_name, h) for _, h in chunk],
+            )
+            results = self.storage.batch_get_v2([transfer]).get(pool_name, [])
+            got = 0
+            for i, (base, _) in enumerate(chunk):
+                if i >= len(results) or not results[i]:
+                    # Stop at the first gap rather than scattering past it: the
+                    # pages are a chain, and a later page restored over a missing
+                    # earlier one would leave the pool holding a prefix that
+                    # never existed.
+                    break
+                blob = host.get_data_page(int(host_indices[i].item()), flat=True)
+                self.codec.scatter(base, pool_name, blob.view(torch.uint8))
+                got += 1
+            return got
         finally:
             host.free(slots)
 
