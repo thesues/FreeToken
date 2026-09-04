@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -201,6 +202,28 @@ class Scheduler(SchedulerIOMixin):
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 
+    def _log_l3_summary(self, *, every_s: float = 60.0) -> None:
+        """The hit rate, on a slow timer, in the same log as everything else.
+
+        A rate is the only number that answers "is this tier worth its cost",
+        and `#cached-token` on a prefill line cannot give it: that says how much
+        one request reused, not how often a lookup found anything. Emitted here
+        rather than through /v1/stats because the status message the API process
+        reads has a fixed per-batch schema, and a counter that only shows up in
+        a place nobody greps during an incident is a counter nobody reads.
+        """
+        writer = getattr(self.cache_manager, "l3_writer", None)
+        if writer is None:
+            return
+        now = time.monotonic()
+        last = getattr(self, "_l3_summary_at", 0.0)
+        if now - last < every_s:
+            return
+        self._l3_summary_at = now
+        stats = writer.tier.stats
+        if stats.lookups or stats.writes:
+            logger.info("%s", stats.line())
+
     def _drain_l3_writes(self) -> None:
         """Collect what the L3 writer finished since the last iteration.
 
@@ -252,6 +275,7 @@ class Scheduler(SchedulerIOMixin):
         # it at submit time — so this is a report, not a synchronisation point,
         # and a slow backend delays nothing here.
         self._drain_l3_writes()
+        self._log_l3_summary()
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -305,6 +329,7 @@ class Scheduler(SchedulerIOMixin):
         # it at submit time — so this is a report, not a synchronisation point,
         # and a slow backend delays nothing here.
         self._drain_l3_writes()
+        self._log_l3_summary()
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a

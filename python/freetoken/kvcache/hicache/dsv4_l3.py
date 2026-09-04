@@ -39,6 +39,68 @@ from .storage import HiCacheStorage, PoolHitPolicy, PoolTransfer
 logger = logging.getLogger(__name__)
 
 
+class L3Stats:
+    """What the tier actually did, counted where it happens.
+
+    The number this exists for is the hit rate, and the reason it is a set of
+    counters rather than one is that the ways a lookup can fail to help are not
+    interchangeable:
+
+      miss     the pages are not in storage. Nothing to tune; the prefix was
+               never written, or was written by an engine with another layout.
+      expired  the pages are there and the fetch did not finish in time. The
+               deadline or the backend is the problem, not the cache.
+      declined the in-flight bound refused it. The bound is the problem.
+
+    Reporting those as one "miss" would hide the only two that a knob can fix.
+
+    `adopted` is separate from `hits` on purpose. A fetch can succeed and still
+    not help — admission may find L1 already had those pages, or no room to put
+    them. hits/lookups says whether the data is there; adopted/lookups says
+    whether it was worth fetching, and only the second justifies the tier.
+    """
+
+    __slots__ = ("_lock", "lookups", "hits", "adopted", "misses", "expired",
+                 "declined", "errors", "pages_offered", "pages_adopted",
+                 "bytes_read", "writes", "pages_stored", "pages_present",
+                 "pages_no_window", "bytes_written", "write_failures",
+                 "write_drops")
+
+    def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
+        for f in self.__slots__[1:]:
+            setattr(self, f, 0)
+
+    def bump(self, **kw) -> None:
+        with self._lock:
+            for k, v in kw.items():
+                setattr(self, k, getattr(self, k) + v)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            d = {f: getattr(self, f) for f in self.__slots__[1:]}
+        look = d["lookups"] or 1
+        d["hit_rate"] = round(d["hits"] / look, 4)
+        d["adopt_rate"] = round(d["adopted"] / look, 4)
+        return d
+
+    def line(self) -> str:
+        """One log line. Rates first, because that is what anyone reads."""
+        d = self.snapshot()
+        return (
+            f"L3 summary: lookups={d['lookups']} hit={d['hit_rate']:.1%} "
+            f"adopted={d['adopt_rate']:.1%} | hits={d['hits']} adopted={d['adopted']} "
+            f"miss={d['misses']} expired={d['expired']} declined={d['declined']} "
+            f"errors={d['errors']} | pages offered={d['pages_offered']} "
+            f"adopted={d['pages_adopted']} | read={d['bytes_read'] / 2**20:.1f} MiB | "
+            f"writes={d['writes']} pages stored={d['pages_stored']} "
+            f"present={d['pages_present']} no-window={d['pages_no_window']} "
+            f"wrote={d['bytes_written'] / 2**20:.1f} MiB "
+            f"failed={d['write_failures']} dropped={d['write_drops']}"
+        )
+
+
 @dataclass
 class ReadReport:
     """How much of the candidate prefix came back, and from where.
@@ -105,6 +167,10 @@ class DSV4L3Tier:
         self.storage = storage
         self.codec = DSV4PageCodec(pool)
         self.staging_pages = staging_pages
+        # One per tier, shared by the writer and the prefetcher: they are two
+        # halves of the same cache and a hit rate split across two objects is a
+        # hit rate nobody computes.
+        self.stats = L3Stats()
 
         # One staging pool per storage pool: the two carry different bytes per
         # page, and `get_data_page` derives its stride from that.
@@ -178,11 +244,21 @@ class DSV4L3Tier:
                 have = self._existing_prefix(pool_name, todo)
                 if have:
                     report.skipped_present[pool_name] = have
+                    self.stats.bump(pages_present=have)
                     todo = todo[have:]
             stored = 0
             for chunk in _chunks(todo, self.staging_pages):
                 stored += self._write_chunk(pool_name, chunk)
             report.stored[pool_name] = stored
+            # Counted here as well as in `L3Writer`: they are two write paths
+            # into the same tier, and a counter that only sees one of them means
+            # something different depending on which was used.
+            page_bytes = (self.codec.full_page_bytes if pool_name == POOL_FULL
+                          else self.codec.window_page_bytes)
+            self.stats.bump(writes=1, pages_stored=stored,
+                            bytes_written=stored * page_bytes)
+            if stored != len(todo):
+                self.stats.bump(write_failures=1)
 
         if not report.complete:
             logger.warning("DSV4 L3 write incomplete — %s", report)
@@ -202,6 +278,7 @@ class DSV4L3Tier:
             return list(pages)
         keep = [p for p in pages if self.codec.window_resident(p[0])]
         report.skipped_not_resident = len(pages) - len(keep)
+        self.stats.bump(pages_no_window=report.skipped_not_resident)
         return keep
 
     def _existing_prefix(self, pool_name: str, todo: list[tuple[int, str]]) -> int:

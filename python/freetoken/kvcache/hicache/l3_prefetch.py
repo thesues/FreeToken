@@ -108,8 +108,10 @@ class L3Prefetcher:
                            if e.status is Status.WAITING)
             if inflight >= self.max_inflight:
                 self.declined += 1
+                self.tier.stats.bump(declined=1)
                 return False
             self._entries[key] = _Entry(list(page_hashes), time.monotonic())
+        self.tier.stats.bump(lookups=1)
         self._ensure_thread()
         self._q.put(key)
         return True
@@ -127,6 +129,7 @@ class L3Prefetcher:
                     entry.status = Status.EXPIRED
                     entry.abandoned = True
                     self.expired += 1
+                    self.tier.stats.bump(expired=1)
                     return Status.EXPIRED, None
                 return Status.WAITING, None
             return entry.status, entry.ready
@@ -180,6 +183,7 @@ class L3Prefetcher:
                 ready = self._fetch(entry)
             except Exception as e:  # noqa: BLE001
                 logger.warning("L3 prefetch failed: %s", e)
+                self.tier.stats.bump(errors=1)
                 ready = None
             with self._lock:
                 entry = self._entries.get(key)
@@ -190,6 +194,17 @@ class L3Prefetcher:
                 else:
                     entry.ready = ready
                     entry.status = Status.READY if ready else Status.MISS
+                    if ready:
+                        # Counted here rather than at the fetch, so a result the
+                        # scheduler had already abandoned is not scored a hit.
+                        self.tier.stats.bump(
+                            hits=1, pages_offered=ready.n_pages,
+                            bytes_read=ready.n_pages * (
+                                self.tier.codec.full_page_bytes
+                                + self.tier.codec.window_page_bytes),
+                        )
+                    else:
+                        self.tier.stats.bump(misses=1)
                     stale = None
             if stale:
                 self._free(stale)

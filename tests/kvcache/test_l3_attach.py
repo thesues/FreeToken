@@ -166,3 +166,150 @@ def test_detach_is_safe_when_nothing_was_attached():
     m = _Manager()
     detach_l3(m)
     detach_l3(m)
+
+
+# --------------------------------------------------------------------------- #
+# hit-rate accounting
+# --------------------------------------------------------------------------- #
+def test_the_ways_a_lookup_fails_are_counted_apart():
+    """miss / expired / declined are not interchangeable, and reporting them as
+    one number would hide the only two a knob can fix. A miss says the data is
+    not there; expired says it is there and the deadline or backend is too slow;
+    declined says the in-flight bound refused it."""
+    from freetoken.kvcache.hicache.dsv4_l3 import L3Stats
+
+    st = L3Stats()
+    st.bump(lookups=4, hits=1, misses=1, expired=1, declined=1)
+    d = st.snapshot()
+    assert (d["misses"], d["expired"], d["declined"]) == (1, 1, 1)
+    assert d["hit_rate"] == 0.25
+
+
+def test_adopted_is_counted_apart_from_hit():
+    """A fetch can succeed and still buy nothing — admission may find L1 already
+    had those pages. hits/lookups says the data is there; adopted/lookups says
+    it was worth fetching, and only the second justifies the tier."""
+    from freetoken.kvcache.hicache.dsv4_l3 import L3Stats
+
+    st = L3Stats()
+    st.bump(lookups=10, hits=8, adopted=3)
+    d = st.snapshot()
+    assert d["hit_rate"] == 0.8 and d["adopt_rate"] == 0.3
+
+
+def test_the_rate_is_defined_with_no_lookups():
+    """The summary runs on a timer and will be asked before anything happens."""
+    from freetoken.kvcache.hicache.dsv4_l3 import L3Stats
+
+    d = L3Stats().snapshot()
+    assert d["hit_rate"] == 0.0 and d["adopt_rate"] == 0.0
+    assert "L3 summary" in L3Stats().line()
+
+
+def test_counting_is_safe_from_two_threads():
+    """The fetch thread and the scheduler both bump these."""
+    import threading
+    from freetoken.kvcache.hicache.dsv4_l3 import L3Stats
+
+    st = L3Stats()
+    N, T = 20000, 8
+
+    def worker():
+        for _ in range(N):
+            # Several fields per call: read-modify-write is not atomic under the
+            # GIL, and more bytecodes per bump means more chances to be switched
+            # out mid-increment. With one field and a few thousand iterations
+            # the race is real but rarely observed, which makes for a test that
+            # passes with the lock removed.
+            st.bump(lookups=1, hits=1, pages_offered=2, bytes_read=64)
+
+    ts = [threading.Thread(target=worker) for _ in range(T)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    d = st.snapshot()
+    assert d["lookups"] == N * T, f"lost {N * T - d['lookups']} increments"
+    assert d["pages_offered"] == 2 * N * T
+    assert d["bytes_read"] == 64 * N * T
+
+
+def test_a_prefetch_records_every_outcome_it_reaches():
+    """End to end through the real prefetcher, not the counters in isolation."""
+    import time as _t
+    from freetoken.kvcache.hicache.dsv4_l3 import DSV4L3Tier
+    from freetoken.kvcache.hicache.l3_prefetch import L3Prefetcher, Status
+    from test_dsv4_l3 import FakeStorage, P as _P
+
+    pool = _pool()
+    pool.bind_window_pages(0, 0)
+    tier = DSV4L3Tier(pool, FakeStorage(), staging_pages=2)
+    tier.write_pages([(0, "h0")])
+    pf = L3Prefetcher(tier, deadline_s=5)
+    try:
+        pf.start("a", ["h0"])
+        for _ in range(200):
+            if pf.poll("a")[0] is Status.READY:
+                break
+            _t.sleep(0.01)
+        pf.release("a")
+        pf.start("b", ["absent"])
+        for _ in range(200):
+            if pf.poll("b")[0] is Status.MISS:
+                break
+            _t.sleep(0.01)
+        pf.release("b")
+        d = tier.stats.snapshot()
+        assert d["lookups"] == 2, d
+        assert d["hits"] == 1 and d["misses"] == 1, d
+        assert d["hit_rate"] == 0.5
+        assert d["pages_offered"] == 1 and d["bytes_read"] > 0
+        assert d["writes"] >= 1 and d["pages_stored"] >= 1
+    finally:
+        pf.stop()
+
+
+def test_a_slow_backend_is_counted_expired_not_missed():
+    """Through the real prefetcher, because the distinction only exists there.
+
+    A miss says the pages are not in storage; expired says they are and the
+    fetch ran out of time. Conflating them points at the wrong fix — one is a
+    cold cache, the other is a deadline or a slow backend, and only the second
+    is a knob.
+    """
+    import threading as _th
+    import time as _t
+    from freetoken.kvcache.hicache.dsv4_l3 import DSV4L3Tier
+    from freetoken.kvcache.hicache.l3_prefetch import L3Prefetcher, Status
+    from test_dsv4_l3 import FakeStorage
+
+    pool = _pool()
+    pool.bind_window_pages(0, 0)
+    tier = DSV4L3Tier(pool, FakeStorage(), staging_pages=2)
+    tier.write_pages([(0, "h0")])          # the pages ARE there
+    gate = _th.Event()
+
+    class Slow(FakeStorage):
+        def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+            gate.wait(timeout=10)
+            return super().batch_exists_v2(keys, pool_transfers, extra_info)
+
+    slow = Slow()
+    slow.registered_pools = tier.storage.registered_pools
+    slow.blobs = tier.storage.blobs
+    tier.storage = slow
+
+    before = tier.stats.snapshot()
+    pf = L3Prefetcher(tier, deadline_s=0.05)
+    try:
+        pf.start("slow", ["h0"])
+        for _ in range(300):
+            if pf.poll("slow")[0] is Status.EXPIRED:
+                break
+            _t.sleep(0.01)
+        d = tier.stats.snapshot()
+        assert d["expired"] - before["expired"] == 1, d
+        assert d["misses"] - before["misses"] == 0, (
+            "a fetch that ran out of time was booked as a cold cache"
+        )
+    finally:
+        gate.set()
+        pf.release("slow")
+        pf.stop()

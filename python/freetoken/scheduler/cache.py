@@ -315,7 +315,10 @@ class CacheManager:
                 return handle, handle.cached_len
             have = handle.cached_len // self.page_size
             if ready.n_pages <= have:
-                return handle, handle.cached_len          # L1 already had it all
+                # A hit that bought nothing: L1 already covered it. Worth
+                # counting apart from a miss — it says the tier is working and
+                # the prefetch was unnecessary, which is a different fix.
+                return handle, handle.cached_len
             gained = ready.n_pages - have
             pages = self._allocate(gained)
             if pages is None or len(pages) < gained * self.page_size:
@@ -326,7 +329,9 @@ class CacheManager:
                 return handle, handle.cached_len
             try:
                 self._scatter_l3_pages(ready, have, pages)
-                return self._commit_l3_prefix(req, handle, pages, ready.n_pages)
+                out = self._commit_l3_prefix(req, handle, pages, ready.n_pages)
+                pf.tier.stats.bump(adopted=1, pages_adopted=gained)
+                return out
             except Exception:  # noqa: BLE001
                 # This path is not yet exercised end to end — it needs an image
                 # built from this branch, which the installed package in the

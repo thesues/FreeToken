@@ -101,6 +101,7 @@ class L3Writer:
                     "L3 write queue over budget (%.1f MiB); dropping a %d-page prefix",
                     self._queued_bytes / 2**20, len(pages),
                 )
+                self.tier.stats.bump(write_drops=1)
                 return False
 
         batch: list[PendingPage] = []
@@ -161,12 +162,16 @@ class L3Writer:
             tag, batch, nbytes = item
             try:
                 stored = self._write(batch)
+                self.tier.stats.bump(writes=1, pages_stored=stored, bytes_written=nbytes)
+                if stored != len(batch):
+                    self.tier.stats.bump(write_failures=1)
                 self._out.put(WriteOutcome(tag, stored, len(batch)))
             except Exception as e:  # noqa: BLE001
                 # A storage failure must not take the engine with it. The prefix
                 # simply is not durable, which the next reader discovers as a
                 # miss — the outcome a caller would have reached anyway.
                 logger.warning("L3 write failed: %s", e)
+                self.tier.stats.bump(write_failures=1)
                 self._out.put(WriteOutcome(tag, 0, len(batch), error=str(e)))
             finally:
                 with self._lock:
