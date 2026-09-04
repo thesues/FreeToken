@@ -87,6 +87,13 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
+        # An L3 tier, if one is configured. Never fatal: a backend that cannot be
+        # built leaves the manager exactly as it was, which is an engine with no
+        # external KV tier — the state every call site below already handles.
+        from freetoken.kvcache.hicache.attach import attach_l3
+
+        attach_l3(self.cache_manager, self.engine.kv_cache, config)
+
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -673,6 +680,16 @@ class Scheduler(SchedulerIOMixin):
         msg = self._pending_rebuild
         assert msg is not None
         self._pending_rebuild = None
+        # A rebuild reallocates every tier buffer, so the codec's view of them
+        # stops being true. A writer still holding gathered bytes would persist
+        # a page layout that no longer exists, and a prefetch in flight would
+        # scatter into buffers that moved. Tear the tier down first and rebuild
+        # it after; losing what was queued costs reprefills, not correctness.
+        from freetoken.kvcache.hicache.attach import attach_l3, detach_l3
+
+        had_l3 = getattr(self.cache_manager, "l3_writer", None) is not None
+        if had_l3:
+            detach_l3(self.cache_manager)
         requested = {
             "moe_cache_size": msg.moe_cache_size,
             "num_pages": msg.num_pages,
@@ -738,6 +755,12 @@ class Scheduler(SchedulerIOMixin):
         # mistaken for a rebuild failure and roll back the geometry the engine now serves.
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
+        if had_l3:
+            # Same config, new buffers. If it cannot come back the engine simply
+            # runs without a tier, which is the documented fallback everywhere
+            # else in this path.
+            attach_l3(self.cache_manager, self.engine.kv_cache, self.config)
+
 
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and

@@ -385,6 +385,59 @@ def parse_args(
         help="The source to download model from. Either 'huggingface' or 'modelscope'.",
     )
 
+    # ----- L3 (external storage) tier -------------------------------------- #
+    # Off unless a backend is named. Everything downstream is written so that an
+    # absent tier costs an attribute lookup, and a tier that fails to build logs
+    # and leaves the engine as it was.
+    parser.add_argument(
+        "--hicache-storage-backend",
+        type=str,
+        default=None,
+        help="Enable an L3 KV tier backed by external storage. Only 'dynamic' is "
+        "supported: the class is named in --hicache-storage-backend-extra-config, "
+        "which is how a backend written against sglang's dynamic backend runs "
+        "here unmodified. DSV4 only.",
+    )
+    parser.add_argument(
+        "--hicache-storage-backend-extra-config",
+        type=str,
+        default=None,
+        help='JSON. Needs module_path and class_name; the rest is passed through to '
+        'the backend. Example: \'{"module_path":"autumn_kvcache.sglang_backend",'
+        '"class_name":"AutumnKVCacheStorage","interface_v1":1,"endpoint":"IP:9001"}\'',
+    )
+    parser.add_argument(
+        "--hicache-staging-pages",
+        type=int,
+        default=8,
+        help="Pinned host pages held for transfers in flight. Not a cache — nothing "
+        "is kept between operations — so this is a throughput knob, and it bounds "
+        "how many pages one read or write moves at a time.",
+    )
+    parser.add_argument(
+        "--hicache-prefetch-deadline-s",
+        type=float,
+        default=0.25,
+        help="How long a fetch may run before the request is admitted on its GPU "
+        "prefix alone. A prefetch may save work; it must never add latency.",
+    )
+    parser.add_argument(
+        "--hicache-max-inflight",
+        type=int,
+        default=2,
+        help="Fetches in flight. Beyond this, requests are declined rather than "
+        "queued — queueing would turn a busy moment into latency for everything "
+        "behind them. Also bounds the staging pool.",
+    )
+    parser.add_argument(
+        "--hicache-write-queue-bytes",
+        type=int,
+        default=512 << 20,
+        help="Byte budget for prefixes gathered and waiting to be written. Over "
+        "budget, a prefix is dropped and counted: missing L3 costs one reprefill, "
+        "blocking the scheduler costs every request in flight.",
+    )
+
     parser.add_argument(
         "--cache-type",
         type=str,
