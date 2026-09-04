@@ -52,10 +52,15 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        # TODO: consider host cache match case
         mr = self.cache_manager.match_req(req)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
+        # Take an L3 fetch only if it is already sitting there. Never wait: the
+        # admission loop breaks rather than skips, so waiting here would stall
+        # every request behind this one. A fetch that is still running, expired,
+        # or missing simply leaves this request on its L1 prefix, which is what
+        # it would have had with no L3 tier at all.
+        handle, cached_len = self.cache_manager.adopt_l3_prefix(req, handle)
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
@@ -247,6 +252,30 @@ class PrefillManager:
         self.pending_list.append(
             PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
         )
+        self._start_l3_prefetch(req)
+
+    def _start_l3_prefetch(self, req: UserMsg) -> None:
+        """Ask L3 for this prompt's prefix now, on ARRIVAL rather than at admission.
+
+        Admission cannot wait. `schedule_next_batch` BREAKS on the first request
+        it cannot admit rather than skipping it, so a request that returned None
+        to wait for a fetch would hold up every request behind it — the "never
+        add latency" rule violated at the queue level rather than the request
+        level. Starting here gives the fetch the time a request already spends
+        queued, and admission consumes whatever happens to be ready.
+
+        Multimodal requests are excluded for the same reason `match_req` excludes
+        them: their KV is never shared, so there is nothing in L3 to find.
+        """
+        pf = getattr(self.cache_manager, "l3_prefetcher", None)
+        if pf is None or req.mm_embeds is not None:
+            return
+        from freetoken.kvcache.hicache.hashing import chain_page_hashes
+
+        page_size = self.cache_manager.page_size
+        hashes = chain_page_hashes(req.input_ids.tolist(), page_size)
+        if hashes:
+            pf.start(req.uid, hashes)
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

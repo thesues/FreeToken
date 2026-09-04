@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
+
+logger = init_logger(__name__)
 
 # Proactive out-of-window free_swa runs every `interval` forwards (== sglang SWA_EVICTION_INTERVAL).
 def _swa_eviction_interval() -> int:
@@ -285,6 +287,115 @@ class CacheManager:
                     self.ensure_swa_slots(len(allocated))
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+
+    def adopt_l3_prefix(self, req, handle):
+        """Extend a request's cached prefix with pages already fetched from L3.
+
+        Returns `(handle, cached_len)` unchanged unless a fetch for this request
+        is sitting ready AND covers more than L1 already did. Never waits, never
+        starts a fetch: `PrefillManager` starts them on arrival, because the
+        admission loop breaks rather than skips and waiting here would stall
+        everything behind this request.
+
+        The device writes happen here, on the scheduler thread, because this is
+        the only thread that may touch the page table and the tree. The fetch
+        thread only ever filled a pinned host buffer.
+        """
+        pf = getattr(self, "l3_prefetcher", None)
+        if pf is None:
+            return handle, handle.cached_len
+        from freetoken.kvcache.hicache.l3_prefetch import Status
+
+        status, ready = pf.poll(req.uid)
+        try:
+            if status is not Status.READY or ready is None:
+                # WAITING is the interesting one: leave the fetch running and
+                # take the L1 prefix now. If it lands before a later chunk of
+                # this same request is admitted, that chunk gets it.
+                return handle, handle.cached_len
+            have = handle.cached_len // self.page_size
+            if ready.n_pages <= have:
+                return handle, handle.cached_len          # L1 already had it all
+            gained = ready.n_pages - have
+            pages = self._allocate(gained)
+            if pages is None or len(pages) < gained * self.page_size:
+                # No room. Not an error — the request proceeds on L1, which is
+                # exactly what it would have done without a tier.
+                if pages is not None:
+                    self._free(pages)
+                return handle, handle.cached_len
+            try:
+                self._scatter_l3_pages(ready, have, pages)
+                return self._commit_l3_prefix(req, handle, pages, ready.n_pages)
+            except Exception:  # noqa: BLE001
+                # This path is not yet exercised end to end — it needs an image
+                # built from this branch, which the installed package in the
+                # serving pod is not. Until then it must be able to fail without
+                # taking a request with it: give the pages back and admit on the
+                # L1 prefix, which is the no-L3 behaviour.
+                logger.exception("L3 prefix adoption failed; admitting on L1 alone")
+                self._free(pages)
+                return handle, handle.cached_len
+        finally:
+            # Once, whatever happened. A fetch never released holds its staging
+            # slots forever and the pool drains one request at a time.
+            if status is not Status.WAITING:
+                pf.release(req.uid)
+
+    def _scatter_l3_pages(self, ready, first_page: int, device_pages) -> None:
+        """Copy the fetched pages out of staging and into the device pool."""
+        from freetoken.kvcache.hicache.dsv4_codec import POOL_FULL, POOL_WINDOW
+
+        tier = self.l3_prefetcher.tier
+        for pool in (POOL_FULL, POOL_WINDOW):
+            slots = ready.slots.get(pool)
+            if slots is None:
+                continue
+            host = tier.staging[pool]
+            for k in range(first_page, ready.n_pages):
+                if (k - first_page + 1) * self.page_size > len(device_pages):
+                    break
+                base = int(device_pages[(k - first_page) * self.page_size].item())
+                if pool == POOL_WINDOW and not tier.codec.window_resident(base):
+                    # Older pages have no window rows and need none; only the
+                    # sliding tail does, and that page is bound by _allocate.
+                    continue
+                blob = host.get_data_page(int(slots[k * self.page_size].item()), flat=True)
+                tier.codec.scatter(base, pool, blob.view(torch.uint8))
+
+    def _commit_l3_prefix(self, req, handle, pages, n_pages: int):
+        """Put the restored pages in the tree and re-match, so the request sees
+        them the way it would see any other cache hit.
+
+        Inserting rather than hand-editing the handle is what keeps eviction
+        accounting, tombstones and the window mapping consistent — all of which
+        `insert` already maintains and none of which this path should learn to
+        reproduce.
+        """
+        n_tokens = n_pages * self.page_size
+        ids = req.input_ids[:n_tokens]
+        # The restored pages sit at the END of the prefix; the ones L1 already
+        # had come from the tree and stay where they are. `insert` reconciles
+        # the two and hands back the tree's canonical slots.
+        have = handle.cached_len
+        combined = torch.cat([
+            self.page_table[req.table_idx, :have] if have else pages[:0],
+            pages,
+        ])
+        # Everything before the sliding window is out of window by construction:
+        # only the last page carries window rows (see the codec's residency
+        # rule), so the rest must go in tombstoned or `insert` would adopt swa
+        # slots that were never restored.
+        window_tokens = self.swa_pool.sliding_window_size if self.swa_paged else 0
+        evicted = max(0, n_tokens - window_tokens)
+        _, freed = self.prefix_cache.insert(
+            ids, combined, swa_evicted_seqlen=evicted, update_kv_after_len=have)
+        self._free_swa(freed)
+        self._free(freed)
+        self.unlock(handle)
+        new_handle = self.match_req(req).cuda_handle
+        self.lock(new_handle)
+        return new_handle, new_handle.cached_len
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
