@@ -184,12 +184,28 @@ class DSV4L3Tier:
             # flight and nothing between calls, so `device_size` — which exists
             # for the load-back deadlock the constructor guards against — is
             # zero here rather than a number invented to satisfy the guard.
-            host = HostKVCache(
-                device_size=0,
-                page_size=pool.P,
-                bytes_per_token=page_bytes // pool.P,
-                host_size_bytes=staging_pages * page_bytes,
-            )
+            # OUTSIDE inference mode, deliberately. `launch.py` builds the
+            # scheduler under `with torch.inference_mode()`, so a tensor
+            # allocated here inherits that and becomes an INFERENCE tensor —
+            # and PyTorch forbids an in-place update to one from outside the
+            # mode. The L3 writer runs on its own thread, which is outside it,
+            # so `set_from_flat_data_page`'s `dst.copy_(...)` raised
+            # "Inplace update to inference tensor outside InferenceMode is not
+            # allowed" on every write. Reads were unaffected, so the tier
+            # looked alive: it logged lookups and misses while storing nothing.
+            #
+            # These buffers are staging for a host<->storage transfer. They hold
+            # nothing between calls and are not part of any autograd or
+            # inference graph, so inference-tensor semantics were never wanted
+            # here — the mode was inherited by accident of where the tier is
+            # constructed, not chosen.
+            with torch.inference_mode(False):
+                host = HostKVCache(
+                    device_size=0,
+                    page_size=pool.P,
+                    bytes_per_token=page_bytes // pool.P,
+                    host_size_bytes=staging_pages * page_bytes,
+                )
             self.staging[name] = host
             self.storage.register_mem_host_pool_v2(host, name)
 
