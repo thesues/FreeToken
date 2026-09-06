@@ -27,6 +27,7 @@ throughput knob, not a hit-rate one.
 from __future__ import annotations
 
 import logging
+from freetoken.utils.logger import init_logger
 from dataclasses import dataclass, field
 
 import torch
@@ -36,7 +37,13 @@ from .dsv4_codec import POOL_FULL, POOL_WINDOW, DSV4PageCodec
 from .host_pool import HostKVCache
 from .storage import HiCacheStorage, PoolHitPolicy, PoolTransfer
 
-logger = logging.getLogger(__name__)
+# `init_logger`, not a bare `getLogger`: this process configures no root
+# handler, so a bare logger falls back to Python's lastResort handler,
+# which drops everything below WARNING. Every INFO line in this package
+# — "L3 tier attached", per-lookup results, write progress — was being
+# discarded, which is why a cross-restart miss could only be diagnosed
+# by counting keys in the cluster by hand.
+logger = init_logger(__name__)
 
 
 class L3Stats:

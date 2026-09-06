@@ -26,6 +26,7 @@ them. It marks the entry abandoned, and the thread frees on its way out.
 from __future__ import annotations
 
 import logging
+from freetoken.utils.logger import init_logger
 import queue
 import threading
 import time
@@ -38,7 +39,13 @@ from .dsv4_codec import POOL_FULL, POOL_WINDOW
 from .dsv4_l3 import DSV4L3Tier
 from .storage import PoolTransfer
 
-logger = logging.getLogger(__name__)
+# `init_logger`, not a bare `getLogger`: this process configures no root
+# handler, so a bare logger falls back to Python's lastResort handler,
+# which drops everything below WARNING. Every INFO line in this package
+# — "L3 tier attached", per-lookup results, write progress — was being
+# discarded, which is why a cross-restart miss could only be diagnosed
+# by counting keys in the cluster by hand.
+logger = init_logger(__name__)
 
 
 class Status(str, Enum):

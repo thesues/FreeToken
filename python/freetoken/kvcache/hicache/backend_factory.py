@@ -26,6 +26,7 @@ the generic path, which costs one extra host memcpy per page.
 
 import importlib
 import logging
+from freetoken.utils.logger import init_logger
 from typing import TYPE_CHECKING, Any, Dict
 
 from freetoken.kvcache.hicache.storage import HiCacheStorage, HiCacheStorageConfig
@@ -33,7 +34,13 @@ from freetoken.kvcache.hicache.storage import HiCacheStorage, HiCacheStorageConf
 if TYPE_CHECKING:
     pass
 
-logger = logging.getLogger(__name__)
+# `init_logger`, not a bare `getLogger`: this process configures no root
+# handler, so a bare logger falls back to Python's lastResort handler,
+# which drops everything below WARNING. Every INFO line in this package
+# — "L3 tier attached", per-lookup results, write progress — was being
+# discarded, which is why a cross-restart miss could only be diagnosed
+# by counting keys in the cluster by hand.
+logger = init_logger(__name__)
 
 
 class StorageBackendFactory:

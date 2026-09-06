@@ -19,12 +19,19 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+from freetoken.utils.logger import init_logger
 
 from .dsv4_l3 import DSV4L3Tier
 from .l3_prefetch import L3Prefetcher
 from .l3_writer import L3Writer
 
-logger = logging.getLogger(__name__)
+# `init_logger`, not a bare `getLogger`: this process configures no root
+# handler, so a bare logger falls back to Python's lastResort handler,
+# which drops everything below WARNING. Every INFO line in this package
+# — "L3 tier attached", per-lookup results, write progress — was being
+# discarded, which is why a cross-restart miss could only be diagnosed
+# by counting keys in the cluster by hand.
+logger = init_logger(__name__)
 
 
 def attach_l3(cache_manager, kv_pool, config) -> bool:
