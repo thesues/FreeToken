@@ -113,7 +113,7 @@ class L3Writer:
                     # history instead. Normal, and the reason the two tiers are
                     # separate objects.
                     continue
-                batch.append(PendingPage(pool, self.tier.key(pool, page_hash), blob))
+                batch.append(PendingPage(pool, self.tier.key(page_hash), blob))
         if not batch:
             return True
 

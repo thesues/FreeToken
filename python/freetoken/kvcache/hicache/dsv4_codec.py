@@ -45,7 +45,14 @@ from ..dsv4_paged_pool import DSV4PagedKVCache
 # Pool names for `PoolTransfer` / `register_mem_host_pool_v2`. Two, not five:
 # the tiers that share a lifetime also share a hit policy, and splitting them
 # further would put five keys and five round trips behind every page.
-POOL_FULL = "dsv4_full"
+# FULL is the PRIMARY pool and must be named `kv`. `batch_exists_v2` opens by
+# probing the primary segment and short-circuits on zero, so a backend built to
+# the sglang contract probes `kv` no matter what this engine calls its pools.
+# Naming it `dsv4_full` meant every lookup probed a segment nothing ever wrote,
+# got nothing, and returned before examining a single real pool — a complete
+# prefix in storage read back as a miss, with no error logged anywhere. Fifty
+# pages were verified present in the cluster while every read said 0.
+POOL_FULL = "kv"
 POOL_WINDOW = "dsv4_window"
 
 

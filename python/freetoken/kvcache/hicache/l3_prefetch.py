@@ -219,7 +219,7 @@ class L3Prefetcher:
         slots: dict[str, torch.Tensor] = {}
         try:
             for pool in (POOL_FULL, POOL_WINDOW):
-                keys = [self.tier.key(pool, h) for h in want]
+                keys = [self.tier.key(h) for h in want]
                 host = self.tier.staging[pool]
                 got = host.alloc(len(keys) * self.tier.pool.P)
                 if got is None:

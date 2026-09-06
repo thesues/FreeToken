@@ -223,15 +223,23 @@ class DSV4L3Tier:
 
     # ----- keys ------------------------------------------------------------ #
 
-    def key(self, pool_name: str, page_hash: str) -> str:
-        """The storage name of one page.
+    def key(self, page_hash: str) -> str:
+        """The storage name of one page, WITHOUT a pool segment.
 
         The layout signature leads because it is the compatibility boundary: two
         engines with different head dims or compress ratios produce blobs of the
         same length for the same tokens, and reading one as the other is silent
         corruption rather than a miss.
+
+        The pool is deliberately absent. The backend adds it — that is the whole
+        point of `PoolTransfer.name`, and `batch_exists_v2` probes a sidecar by
+        re-scoping the PRIMARY key list into that pool's segment. Embedding the
+        pool here made the two disagree: writes went to
+        `.../dsv4_window/<sig>/dsv4_window/<hash>` while probes asked for
+        `.../dsv4_window/<sig>/kv/<hash>`, so every window page read as absent
+        and the prefix collapsed to zero however much was really stored.
         """
-        return f"{self.codec.layout_signature}/{pool_name}/{page_hash}"
+        return f"{self.codec.layout_signature}/{page_hash}"
 
     # ----- write ----------------------------------------------------------- #
 
@@ -312,7 +320,7 @@ class DSV4L3Tier:
         #
         # `todo` for the window pool is already the resident suffix, so a
         # leading count over that list means what it says.
-        keys = [self.key(pool_name, h) for _, h in todo]
+        keys = [self.key(h) for _, h in todo]
         try:
             result = self.storage.batch_exists_v2(keys)
         except NotImplementedError:
@@ -338,7 +346,7 @@ class DSV4L3Tier:
             transfer = PoolTransfer(
                 name=pool_name,
                 host_indices=host_indices,
-                keys=[self.key(pool_name, h) for _, h in chunk],
+                keys=[self.key(h) for _, h in chunk],
             )
             results = self.storage.batch_set_v2([transfer])
             return sum(1 for ok in results.get(pool_name, []) if ok)
@@ -366,10 +374,22 @@ class DSV4L3Tier:
         """
         if not pages:
             return 0
-        full_keys = [self.key(POOL_FULL, h) for _, h in pages]
+        full_keys = [self.key(h) for _, h in pages]
+        # `keys` here is read for its LENGTH — it sizes the trailing window the
+        # sidecar has to cover; the pages actually probed are `full_keys`
+        # re-scoped into this pool's segment. So it must carry the pages the
+        # window can supply, not every page.
+        #
+        # Passing all of them made `TRAILING_PAGES` mean "every window page
+        # present", which is a condition the write side never creates: only the
+        # window-RESIDENT suffix is ever stored (`_resident_subset`), because
+        # older pages have slid out of the window by construction. The two ends
+        # were describing different sets, and the prefix collapsed to the window
+        # floor or to zero.
+        resident = [p for p in pages if self.codec.window_resident(p[0])]
         window = PoolTransfer(
             name=POOL_WINDOW,
-            keys=[self.key(POOL_WINDOW, h) for _, h in pages],
+            keys=[self.key(h) for _, h in resident],
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         try:
@@ -430,7 +450,7 @@ class DSV4L3Tier:
             transfer = PoolTransfer(
                 name=pool_name,
                 host_indices=host_indices,
-                keys=[self.key(pool_name, h) for _, h in chunk],
+                keys=[self.key(h) for _, h in chunk],
             )
             results = self.storage.batch_get_v2([transfer]).get(pool_name, [])
             got = 0
