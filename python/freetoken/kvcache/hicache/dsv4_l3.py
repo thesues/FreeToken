@@ -396,7 +396,19 @@ class DSV4L3Tier:
             result = self.storage.batch_exists_v2(full_keys, [window])
         except NotImplementedError:
             return 0
-        return min(int(getattr(result, "kv_hit_pages", 0) or 0), len(pages))
+        kv_hit = int(getattr(result, "kv_hit_pages", 0) or 0)
+        # Logged here, unthrottled, because the periodic summary is not enough
+        # to answer "did this lookup hit". That summary is emitted from the
+        # scheduler loop, rate-limited, and only while the engine is busy — so
+        # after a single request the engine goes idle and the counters it
+        # updated are never printed. Diagnosing a cross-restart miss took a
+        # full day partly because the one number that settled it was invisible.
+        logger.info(
+            "L3 restorable_prefix: asked=%d resident_window=%d -> kv_hit=%d pools=%s",
+            len(pages), len(resident), kv_hit,
+            getattr(result, "extra_pool_hit_pages", None),
+        )
+        return min(kv_hit, len(pages))
 
     def read_pages(self, pages: list[tuple[int, str]]) -> ReadReport:
         """Restore a prefix into the device pool.
