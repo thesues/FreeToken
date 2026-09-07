@@ -21,7 +21,7 @@ import json
 import logging
 from freetoken.utils.logger import init_logger
 
-from .dsv4_l3 import DSV4L3Tier
+from .dsv4_l3 import DSV4L3Tier, window_pages_for
 from .l3_prefetch import L3Prefetcher
 from .l3_writer import L3Writer
 
@@ -48,9 +48,45 @@ def attach_l3(cache_manager, kv_pool, config) -> bool:
 
     try:
         storage = _load_backend(config)
+        # The longest prefix worth fetching is bounded by the device pool it
+        # has to land in: `full_to_window` carries one entry per full token
+        # slot, so its length in pages is that bound.
+        pool_pages = max(1, kv_pool.full_to_window.numel() // kv_pool.P)
+        window_pages = window_pages_for(kv_pool)
+        # Bounded by the window pool, not the full pool. A prefix longer than
+        # the window tier can cover comes back with its head unbound, goes into
+        # the tree tombstoned, and matches nothing — all of the transfer cost
+        # and none of the benefit.
+        max_pages = int(getattr(config, "hicache_prefetch_pages", 0)
+                        or min(pool_pages, window_pages))
+        max_inflight = int(getattr(config, "hicache_max_inflight", 2))
+        # The writer allocates from the same pools as the prefetcher, so it gets
+        # a reserved share rather than competing for one: fetches in flight
+        # would otherwise hold the pool while every write failed. 32 full pages
+        # is a ~27 MiB write chunk.
+        writer_full = int(getattr(config, "hicache_writer_pages", 0) or 32)
+        budget = int(getattr(config, "hicache_staging_pages", 0) or 0)
+        if budget:
+            # An explicit budget caps memory; the prefetch shrinks to fit it
+            # rather than the tier refusing to attach. A pool that is merely
+            # smaller than ideal should still restore short prefixes.
+            writer_full = max(1, min(writer_full, budget // 4))
+            fits = max(1, (budget - writer_full) // max_inflight)
+            if fits < max_pages:
+                logger.warning(
+                    "L3 prefetch capped at %d pages, not %d: staging budget is "
+                    "%d pages across %d in flight plus a %d-page writer share",
+                    fits, max_pages, budget, max_inflight, writer_full,
+                )
+                max_pages = fits
+        staging_pages = max_pages * max_inflight + writer_full
+
         tier = DSV4L3Tier(
             kv_pool, storage,
-            staging_pages=int(getattr(config, "hicache_staging_pages", 8)),
+            staging_pages=staging_pages,
+            window_staging_pages=staging_pages,
+            writer_pages=writer_full,
+            window_writer_pages=writer_full,
         )
     except Exception:  # noqa: BLE001
         logger.exception("could not build the L3 tier; continuing without one")
@@ -60,10 +96,17 @@ def attach_l3(cache_manager, kv_pool, config) -> bool:
         tier,
         max_queued_bytes=int(getattr(config, "hicache_write_queue_bytes", 512 << 20)),
     )
+    # The deadline has to outlast a full-size fetch or none ever lands. A fetch
+    # moves both tiers of the prefix, ~17.9 MiB per page, so at the ~470 MiB/s
+    # measured against this backend a full-size one is a few seconds. Waiting
+    # costs nothing but a staging slot: `poll` never blocks, so
+    # a fetch still running means this request proceeds without it and the next
+    # one with the same prefix finds it ready.
     cache_manager.l3_prefetcher = L3Prefetcher(
         tier,
-        deadline_s=float(getattr(config, "hicache_prefetch_deadline_s", 0.25)),
-        max_inflight=int(getattr(config, "hicache_max_inflight", 2)),
+        deadline_s=float(getattr(config, "hicache_prefetch_deadline_s", 6.0)),
+        max_inflight=max_inflight,
+        max_pages=max_pages,
     )
     # The digests are what L3 names pages by, and computing them costs a hash
     # per page on the scheduler thread — so they are enabled here, with the
@@ -71,9 +114,14 @@ def attach_l3(cache_manager, kv_pool, config) -> bool:
     cache_manager.prefix_cache.enable_page_hash = True
 
     logger.info(
-        "L3 tier attached: %s, page %d bytes full / %d bytes window, layout %s",
+        "L3 tier attached: %s, page %d bytes full / %d bytes window, layout %s"
+        "; prefetch <=%d pages x%d inflight, staging %d pages per tier "
+        "(%.0f MiB)",
         type(storage).__name__, tier.codec.full_page_bytes,
         tier.codec.window_page_bytes, tier.codec.layout_signature,
+        max_pages, max_inflight, staging_pages,
+        staging_pages * (tier.codec.full_page_bytes
+                         + tier.codec.window_page_bytes) / (1 << 20),
     )
     return True
 

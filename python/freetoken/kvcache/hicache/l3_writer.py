@@ -193,7 +193,7 @@ class L3Writer:
             if not pages:
                 continue
             host = self.tier.staging[pool]
-            for chunk in _chunks(pages, self.tier.staging_pages):
+            for chunk in _chunks(pages, self.tier.writer_capacity[pool]):
                 slots = host.alloc(len(chunk) * self.tier.pool.P)
                 if slots is None:
                     raise RuntimeError(

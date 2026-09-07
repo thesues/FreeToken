@@ -31,8 +31,9 @@ class SchedulerConfig(EngineConfig):
     # was the only one nobody had run.
     hicache_storage_backend: str | None = None
     hicache_storage_backend_extra_config: str | None = None
-    hicache_staging_pages: int = 8
-    hicache_prefetch_deadline_s: float = 0.25
+    hicache_staging_pages: int = 0
+    hicache_prefetch_pages: int = 0
+    hicache_prefetch_deadline_s: float = 6.0
     hicache_max_inflight: int = 2
     hicache_write_queue_bytes: int = 512 << 20
     offline_mode: bool = False

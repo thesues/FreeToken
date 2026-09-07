@@ -409,17 +409,28 @@ def parse_args(
     parser.add_argument(
         "--hicache-staging-pages",
         type=int,
-        default=8,
-        help="Pinned host pages held for transfers in flight. Not a cache — nothing "
-        "is kept between operations — so this is a throughput knob, and it bounds "
-        "how many pages one read or write moves at a time.",
+        default=0,
+        help="Pinned host pages for transfers in flight. 0 derives it from the "
+        "prefetch size and the in-flight count, which is the pairing that has to "
+        "hold: a prefetcher holds its whole prefix until the scheduler consumes "
+        "it, so the pool needs prefetch-pages x max-inflight, not one chunk. Set "
+        "it explicitly to cap the memory instead, and the prefetch shrinks to fit.",
+    )
+    parser.add_argument(
+        "--hicache-prefetch-pages",
+        type=int,
+        default=0,
+        help="Longest prefix one fetch may restore, in pages. 0 uses the sliding "
+        "window's capacity: a page older than that has no window slot to land in, "
+        "so fetching it buys nothing.",
     )
     parser.add_argument(
         "--hicache-prefetch-deadline-s",
         type=float,
-        default=0.25,
-        help="How long a fetch may run before the request is admitted on its GPU "
-        "prefix alone. A prefetch may save work; it must never add latency.",
+        default=6.0,
+        help="How long a fetch may run before it is abandoned. It is not added "
+        "latency — a request never waits on a fetch — so this only has to outlast "
+        "a full-size restore, and a value under that means none ever lands.",
     )
     parser.add_argument(
         "--hicache-max-inflight",
@@ -427,7 +438,7 @@ def parse_args(
         default=2,
         help="Fetches in flight. Beyond this, requests are declined rather than "
         "queued — queueing would turn a busy moment into latency for everything "
-        "behind them. Also bounds the staging pool.",
+        "behind them. Together with the prefetch size it sizes the staging pool.",
     )
     parser.add_argument(
         "--hicache-write-queue-bytes",

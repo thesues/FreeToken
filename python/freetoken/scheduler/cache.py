@@ -320,25 +320,42 @@ class CacheManager:
                 # the prefetch was unnecessary, which is a different fix.
                 return handle, handle.cached_len
             gained = ready.n_pages - have
-            pages = self._allocate(gained)
-            if pages is None or len(pages) < gained * self.page_size:
-                # No room. Not an error — the request proceeds on L1, which is
-                # exactly what it would have done without a tier.
-                if pages is not None:
-                    self._free(pages)
+            try:
+                # Token-granular, exactly as `allocate_paged` does it.
+                # `_allocate` hands back PAGE bases, while everything downstream
+                # works in token slots: the page-table splice in
+                # `_commit_l3_prefix`, and `_free`'s `page_size` stride. Testing
+                # a page count against a token count rejected every fetch that
+                # ever arrived, and `_free` then handed back one slot in
+                # `page_size` of what it had been given.
+                pages = self._page_to_token(self._allocate(gained))
+            except AssertionError:
+                # `_allocate` asserts when eviction cannot free enough; it never
+                # returns empty-handed. No room is not an error — the request
+                # proceeds on L1, which is what it would have done without a
+                # tier.
                 return handle, handle.cached_len
             try:
+                if self.swa_paged:
+                    # The whole restored prefix, exactly as `allocate_paged`
+                    # binds a freshly prefilled one. Its window rows were all
+                    # fetched, so they all have somewhere to land — and they
+                    # have to: a page left unbound goes into the tree as a
+                    # tombstone, and a tombstoned prefix does not match, so the
+                    # next request would reprefill everything this just restored.
+                    if self.is_swa:
+                        self.ensure_swa_slots(len(pages))
+                    self.swa_pool.alloc_swa(pages)
                 self._scatter_l3_pages(ready, have, pages)
                 out = self._commit_l3_prefix(req, handle, pages, ready.n_pages)
                 pf.tier.stats.bump(adopted=1, pages_adopted=gained)
                 return out
             except Exception:  # noqa: BLE001
-                # This path is not yet exercised end to end — it needs an image
-                # built from this branch, which the installed package in the
-                # serving pod is not. Until then it must be able to fail without
-                # taking a request with it: give the pages back and admit on the
-                # L1 prefix, which is the no-L3 behaviour.
+                # Must be able to fail without taking a request with it: give
+                # the slots back — both pools, since the tail may already be
+                # bound — and admit on the L1 prefix, the no-L3 behaviour.
                 logger.exception("L3 prefix adoption failed; admitting on L1 alone")
+                self._free_swa(pages)
                 self._free(pages)
                 return handle, handle.cached_len
         finally:
@@ -357,16 +374,21 @@ class CacheManager:
             if slots is None:
                 continue
             host = tier.staging[pool]
-            for k in range(first_page, ready.n_pages):
+            # The full tier's slots cover the whole prefix; the window tier's
+            # cover only its tail. The two are therefore indexed from different
+            # origins, and `window_first` is where the second one starts.
+            origin = ready.window_first if pool == POOL_WINDOW else 0
+            for k in range(max(first_page, origin), ready.n_pages):
                 if (k - first_page + 1) * self.page_size > len(device_pages):
                     break
                 base = int(device_pages[(k - first_page) * self.page_size].item())
                 if pool == POOL_WINDOW and not tier.codec.window_resident(base):
                     # Older pages have no window rows and need none; only the
-                    # sliding tail does, and that page is bound by _allocate.
+                    # sliding tail does, and that page is bound above.
                     continue
-                blob = host.get_data_page(int(slots[k * self.page_size].item()), flat=True)
-                tier.codec.scatter(base, pool, blob.view(torch.uint8))
+                slot = int(slots[(k - origin) * self.page_size].item())
+                tier.codec.scatter(base, pool, host.get_data_page(slot, flat=True)
+                                   .view(torch.uint8))
 
     def _commit_l3_prefix(self, req, handle, pages, n_pages: int):
         """Put the restored pages in the tree and re-match, so the request sees
@@ -387,14 +409,14 @@ class CacheManager:
             self.page_table[req.table_idx, :have] if have else pages[:0],
             pages,
         ])
-        # Everything before the sliding window is out of window by construction:
-        # only the last page carries window rows (see the codec's residency
-        # rule), so the rest must go in tombstoned or `insert` would adopt swa
-        # slots that were never restored.
-        window_tokens = self.swa_pool.sliding_window_size if self.swa_paged else 0
-        evicted = max(0, n_tokens - window_tokens)
+        # Nothing is tombstoned: every restored page got its window rows back
+        # and a live swa slot to hold them, which is the same state a freshly
+        # prefilled prefix is committed in (`_cache_req_swa` passes the
+        # request's own free frontier, and a single-chunk prefill has not freed
+        # any). Tombstoning instead would insert the prefix unmatchable — the
+        # restore would move every byte and buy the next request nothing.
         _, freed = self.prefix_cache.insert(
-            ids, combined, swa_evicted_seqlen=evicted, update_kv_after_len=have)
+            ids, combined, swa_evicted_seqlen=0, update_kv_after_len=have)
         self._free_swa(freed)
         self._free(freed)
         self.unlock(handle)

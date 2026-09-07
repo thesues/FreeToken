@@ -29,11 +29,16 @@ RATIOS = (0, 0, 4, 128, 4, 128, 4, 0)
 
 
 class FakeStorage(HiCacheStorage):
-    """A dict with the v2 surface. `fail_after` makes writes stop landing."""
+    """A dict with the v2 surface. `fail_after` makes writes stop landing.
 
-    def __init__(self, fail_after: int | None = None, window_pages: int = 1):
-        self.blobs: dict[str, bytes] = {}
-        self.window_pages = window_pages
+    Keyed by (pool, key), because that is what the real backend does: it
+    re-scopes every key into the pool's own segment before touching storage
+    (`_full_key(k, pool_name)`). A flat dict would let the two tiers collide on
+    the same page hash and silently serve one tier's bytes for the other's.
+    """
+
+    def __init__(self, fail_after: int | None = None):
+        self.blobs: dict[tuple[str, str], bytes] = {}
         self.fail_after = fail_after
         self.writes = 0
 
@@ -47,7 +52,7 @@ class FakeStorage(HiCacheStorage):
                     oks.append(False)
                     continue
                 page = host.get_data_page(int(t.host_indices[i].item()), flat=True)
-                self.blobs[key] = bytes(page.view(torch.uint8).tolist())
+                self.blobs[(t.name, key)] = bytes(page.view(torch.uint8).tolist())
                 self.writes += 1
                 oks.append(True)
             out[t.name] = oks
@@ -59,7 +64,7 @@ class FakeStorage(HiCacheStorage):
     def set(self, key, value=None, target_location=None, target_sizes=None): raise NotImplementedError
     def batch_get(self, keys, target_locations=None, target_sizes=None): raise NotImplementedError
     def batch_set(self, keys, values=None, target_locations=None, target_sizes=None): raise NotImplementedError
-    def exists(self, key): return key in self.blobs
+    def exists(self, key): return (POOL_FULL, key) in self.blobs
 
     def batch_get_v2(self, transfers, extra_info=None):
         out = {}
@@ -67,7 +72,7 @@ class FakeStorage(HiCacheStorage):
             host = self.registered_pools[t.name]
             oks = []
             for i, key in enumerate(t.keys):
-                blob = self.blobs.get(key)
+                blob = self.blobs.get((t.name, key))
                 if blob is None:
                     oks.append(False)
                     continue
@@ -80,37 +85,43 @@ class FakeStorage(HiCacheStorage):
         return out
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
-        """The real signature: a primary key list, plus secondary pools.
+        """Mirrors the real backend's fold, including which keys get probed.
 
-        `kv_hit_pages` is the minimum across pools. ALL_PAGES needs every page
-        of [0, kv_hit); TRAILING_PAGES needs only the last `len(keys)` of them,
-        which is how a sliding-window tier says "I only cover the tail".
+        The primary list is probed in the KV pool; each sidecar re-probes THOSE
+        SAME keys inside its own pool and can only narrow the answer.
+        `transfer.keys` is read for its LENGTH alone — that is the contract, and
+        a fake that probed `transfer.keys` instead would let a caller pass the
+        wrong list and still go green.
+
+        TRAILING_PAGES asks for the longest prefix whose last `len(keys)` pages
+        are present in this pool, which is how a sliding-window tier says it
+        only covers the tail.
         """
         n = 0
-        for key in keys:
-            if key not in self.blobs:
+        for k in keys:
+            if (POOL_FULL, k) not in self.blobs:
                 break
             n += 1
+        hits: dict[str, int] = {}
         for t in pool_transfers or []:
-            present = [k in self.blobs for k in t.keys[:n]]
+            if n == 0:
+                break
+            present = [(t.name, k) in self.blobs for k in keys[:n]]
             if t.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                # Longest suffix of [0, n) that is present.
-                trail = 0
-                for ok in reversed(present):
-                    if not ok:
+                trailing = max(1, len(t.keys) if t.keys else 1)
+                boundary = 0
+                for prefix_len in range(n, 0, -1):
+                    lo = max(0, prefix_len - trailing)
+                    if all(present[i] for i in range(lo, prefix_len)):
+                        boundary = prefix_len
                         break
-                    trail += 1
-                # The tail must reach back at least as far as the window does.
-                n = trail if trail < self.window_pages else n
             else:
-                lead = 0
-                for ok in present:
-                    if not ok:
-                        break
-                    lead += 1
-                n = min(n, lead)
+                boundary = next((i for i in range(n) if not present[i]), n)
+            hits[t.name] = boundary
+            n = min(n, boundary)
         res = PoolTransferResult.empty()
         res.update_kv_hit_pages(n)
+        res.extra_pool_hit_pages.update(hits)
         return res
 
 
@@ -140,8 +151,8 @@ def test_a_window_resident_page_is_written_to_both_pools():
     tier = _tier(pool, st)
     rep = tier.write_pages([(0, "h0")])
     assert rep.complete, rep
-    assert tier.key(POOL_FULL, "h0") in st.blobs
-    assert tier.key(POOL_WINDOW, "h0") in st.blobs
+    assert (POOL_FULL, tier.key("h0")) in st.blobs
+    assert (POOL_WINDOW, tier.key("h0")) in st.blobs
 
 
 def test_a_page_that_slid_out_of_the_window_still_stores_its_history():
@@ -155,9 +166,9 @@ def test_a_page_that_slid_out_of_the_window_still_stores_its_history():
     tier = _tier(pool, st)
     rep = tier.write_pages([(0, "h0"), (P, "h1")])
 
-    assert tier.key(POOL_FULL, "h0") in st.blobs
-    assert tier.key(POOL_WINDOW, "h0") not in st.blobs
-    assert tier.key(POOL_WINDOW, "h1") in st.blobs
+    assert (POOL_FULL, tier.key("h0")) in st.blobs
+    assert (POOL_WINDOW, tier.key("h0")) not in st.blobs
+    assert (POOL_WINDOW, tier.key("h1")) in st.blobs
     assert rep.skipped_not_resident == 1
     assert rep.complete, "dropping an out-of-window page is normal, not a failure"
 
@@ -185,7 +196,7 @@ def test_only_a_leading_run_of_existing_pages_is_skipped():
     tier = _tier(pool, st)
     pages = [(0, "h0"), (P, "h1"), (2 * P, "h2")]
     tier.write_pages(pages)
-    del st.blobs[tier.key(POOL_FULL, "h1")]      # punch a hole in the middle
+    del st.blobs[(POOL_FULL, tier.key("h1"))]      # punch a hole in the middle
     before = st.writes
     tier.write_pages(pages)
     # h0 is skipped; h1 and h2 are both rewritten even though h2 was present.
@@ -236,10 +247,15 @@ def test_the_key_leads_with_the_layout_signature():
     tokens; reading one as the other is corruption, not a miss."""
     pool = _pool()
     tier = _tier(pool, FakeStorage())
-    k = tier.key(POOL_FULL, "abc")
+    k = tier.key("abc")
     assert k.startswith(tier.codec.layout_signature + "/")
     assert k.endswith("/abc")
-    assert POOL_FULL in k
+    # No pool segment: the key names the PAGE, and the backend scopes it into
+    # each pool's own segment (`_full_key(k, pool_name)`). Keeping the pools
+    # apart is the backend's job, which is why the fake storage here is keyed by
+    # (pool, key) — a flat dict would let the two tiers serve each other's
+    # bytes and every test would still pass.
+    assert POOL_FULL not in k and POOL_WINDOW not in k
 
 
 def test_a_staging_page_that_does_not_match_the_codec_is_refused():
@@ -318,8 +334,14 @@ def test_the_prefix_stops_at_the_first_missing_page():
     st = FakeStorage()
     tier = _tier(pool, st)
     pages = [(0, "h0"), (P, "h1"), (2 * P, "h2")]
-    tier.write_pages(pages)
-    del st.blobs[tier.key(POOL_FULL, "h1")]
+    # Written the way the scheduler writes: one growing prefix per chunk, so
+    # every page is some commit's trailing page and carries window rows. A
+    # single bulk write would leave window rows on the last page alone, and the
+    # answer below would be 0 — correctly, since a prefix whose last page has no
+    # window rows cannot be attended to.
+    for i in range(1, len(pages) + 1):
+        tier.write_pages(pages[:i])
+    del st.blobs[(POOL_FULL, tier.key("h1"))]
     assert tier.restorable_prefix(pages) == 1
 
 
@@ -330,12 +352,12 @@ def test_a_missing_window_page_at_the_tail_shortens_the_prefix():
     scheduler a prefix it cannot decode from."""
     pool = _pool()
     _bind(pool, 3)
-    st = FakeStorage(window_pages=2)
+    st = FakeStorage()
     tier = _tier(pool, st)
     pages = [(0, "h0"), (P, "h1"), (2 * P, "h2")]
     tier.write_pages(pages)
     assert tier.restorable_prefix(pages) == 3
-    del st.blobs[tier.key(POOL_WINDOW, "h2")]     # the newest window page
+    del st.blobs[(POOL_WINDOW, tier.key("h2"))]     # the newest window page
     assert tier.restorable_prefix(pages) < 3
 
 
@@ -391,7 +413,8 @@ def test_a_page_that_vanishes_between_the_check_and_the_read_stops_the_prefix():
             # The middle page is gone by the time the read lands, although the
             # existence check a moment earlier reported the whole prefix.
             for t in transfers:
-                self.blobs.pop(t.keys[1], None)
+                if len(t.keys) > 1:
+                    self.blobs.pop((t.name, t.keys[1]), None)
             return super().batch_get_v2(transfers)
 
     racy = EvictsMidFlight()

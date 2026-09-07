@@ -158,6 +158,23 @@ class WriteReport:
         return "; ".join(parts)
 
 
+def window_pages_for(pool) -> int:
+    """Trailing pages of a prefix that can carry window rows.
+
+    The window POOL's capacity, not `sliding_window_size`. The latter is 128
+    tokens on DSV4 and reads like the answer, but it is the per-step attention
+    span, not what stays bound: DSV4 prefills in a single chunk and the
+    out-of-window unbind runs when the NEXT chunk is prepared, so at commit the
+    whole prefix is still window-resident and every page of it is stored.
+
+    That is not a detail — it decides whether a restored prefix is reusable at
+    all. Tokens whose swa slots are sentinel go into the tree as tombstones, and
+    a tombstoned prefix does not match, so restoring only a tail would move the
+    bytes and still leave the next request to reprefill from zero.
+    """
+    return max(1, pool.window_pool[0].shape[0] // pool.P)
+
+
 class DSV4L3Tier:
     """Moves whole DSV4 pages between the device pool and an L3 backend."""
 
@@ -167,6 +184,9 @@ class DSV4L3Tier:
         storage: HiCacheStorage,
         *,
         staging_pages: int = 8,
+        window_staging_pages: int | None = None,
+        writer_pages: int | None = None,
+        window_writer_pages: int | None = None,
     ) -> None:
         if staging_pages < 1:
             raise ValueError("need at least one staging page")
@@ -174,6 +194,36 @@ class DSV4L3Tier:
         self.storage = storage
         self.codec = DSV4PageCodec(pool)
         self.staging_pages = staging_pages
+        # How many trailing pages of a prefix carry window rows. DSV4's window
+        # is one page wide (`sliding_window_size` returns P), so this is 1 — and
+        # that is the difference between a restore moving 17 MiB and moving 17
+        # MiB per page. Everything older keeps its full tier and is tombstoned
+        # out of the window on insert, so its window rows are never read back
+        # even when they were stored.
+        self.window_pages = window_pages_for(pool)
+        # Per pool, because the two are wanted in wildly different quantities: a
+        # fetch takes a long prefix from the full tier and a fixed tail from the
+        # window tier. One number for both would size the expensive pool by the
+        # cheap pool's needs.
+        if window_staging_pages is None:
+            window_staging_pages = staging_pages
+        if window_staging_pages < 1:
+            raise ValueError("need at least one window staging page")
+        self.staging_capacity = {
+            POOL_FULL: staging_pages,
+            POOL_WINDOW: window_staging_pages,
+        }
+        # The writer and the prefetcher allocate from the SAME pools, and a
+        # prefetcher holds its slots from the read until the scheduler consumes
+        # them — so without a reserved share, fetches in flight can occupy the
+        # pool and every write fails while they wait, or one writer chunk takes
+        # the pool and every fetch fails. Each side is bounded to its own share;
+        # the pool is sized to hold both. Defaults to the whole pool, which is
+        # right when there is only one client.
+        self.writer_capacity = {
+            POOL_FULL: writer_pages or staging_pages,
+            POOL_WINDOW: window_writer_pages or window_staging_pages,
+        }
         # One per tier, shared by the writer and the prefetcher: they are two
         # halves of the same cache and a hit rate split across two objects is a
         # hit rate nobody computes.
@@ -186,6 +236,7 @@ class DSV4L3Tier:
             (POOL_FULL, self.codec.full_page_bytes),
             (POOL_WINDOW, self.codec.window_page_bytes),
         ):
+            capacity = self.staging_capacity[name]
             # Sized by bytes, not by a ratio against a device pool. There is no
             # L2 tier under the L3-only scope: this buffer holds one chunk in
             # flight and nothing between calls, so `device_size` — which exists
@@ -211,7 +262,7 @@ class DSV4L3Tier:
                     device_size=0,
                     page_size=pool.P,
                     bytes_per_token=page_bytes // pool.P,
-                    host_size_bytes=staging_pages * page_bytes,
+                    host_size_bytes=capacity * page_bytes,
                 )
             self.staging[name] = host
             self.storage.register_mem_host_pool_v2(host, name)
@@ -278,7 +329,7 @@ class DSV4L3Tier:
                     self.stats.bump(pages_present=have)
                     todo = todo[have:]
             stored = 0
-            for chunk in _chunks(todo, self.staging_pages):
+            for chunk in _chunks(todo, self.writer_capacity[pool_name]):
                 stored += self._write_chunk(pool_name, chunk)
             report.stored[pool_name] = stored
             # Counted here as well as in `L3Writer`: they are two write paths
@@ -313,26 +364,32 @@ class DSV4L3Tier:
         return keep
 
     def _existing_prefix(self, pool_name: str, todo: list[tuple[int, str]]) -> int:
-        """How many leading pages the backend already holds.
+        """How many leading pages the backend already holds in THIS pool.
 
         Only a prefix is skippable: pages are chained, so a gap in the middle
         cannot be filled by writing the tail — a later reader stops at the gap
         regardless.
+
+        A sidecar pool has to be asked as a sidecar. `batch_exists` scopes its
+        keys into the DEFAULT segment, so handing it window keys as the primary
+        list answers about the full tier; and since a page hash is the same
+        string in both pools, that answer is "present" for every window page
+        whose full page was already stored — so the window tier stopped being
+        written at all, silently, and a restore found its history and no window
+        rows.
         """
-        # One pool at a time, as the PRIMARY key list. The combined form —
-        # full as primary with window as a trailing secondary — returns the
-        # minimum across pools, which is the right question when READING and
-        # the wrong one here: it would under-report what is already stored and
-        # make every write redo pages that are present.
-        #
-        # `todo` for the window pool is already the resident suffix, so a
-        # leading count over that list means what it says.
         keys = [self.key(h) for _, h in todo]
         try:
-            result = self.storage.batch_exists_v2(keys)
+            if pool_name == POOL_FULL:
+                result = self.storage.batch_exists_v2(keys)
+                return int(getattr(result, "kv_hit_pages", 0) or 0)
+            probe = PoolTransfer(name=pool_name, keys=keys,
+                                 hit_policy=PoolHitPolicy.ALL_PAGES)
+            result = self.storage.batch_exists_v2(keys, [probe])
+            extra = getattr(result, "extra_pool_hit_pages", None) or {}
+            return int(extra.get(pool_name, 0))
         except NotImplementedError:
             return 0
-        return int(getattr(result, "kv_hit_pages", 0) or 0)
 
     def _write_chunk(self, pool_name: str, chunk: list[tuple[int, str]]) -> int:
         host = self.staging[pool_name]
@@ -382,21 +439,19 @@ class DSV4L3Tier:
         if not pages:
             return 0
         full_keys = [self.key(h) for _, h in pages]
-        # `keys` here is read for its LENGTH — it sizes the trailing window the
+        # `keys` is read for its LENGTH — it sizes the trailing window the
         # sidecar has to cover; the pages actually probed are `full_keys`
-        # re-scoped into this pool's segment. So it must carry the pages the
-        # window can supply, not every page.
+        # re-scoped into this pool's segment.
         #
-        # Passing all of them made `TRAILING_PAGES` mean "every window page
-        # present", which is a condition the write side never creates: only the
-        # window-RESIDENT suffix is ever stored (`_resident_subset`), because
-        # older pages have slid out of the window by construction. The two ends
-        # were describing different sets, and the prefix collapsed to the window
-        # floor or to zero.
-        resident = [p for p in pages if self.codec.window_resident(p[0])]
+        # The length is the window width, not a residency probe of the local
+        # pool. Residency was the wrong source twice over: a prefetcher has no
+        # page bases to probe (its pages are not allocated yet, so it passed
+        # zero for all of them and asked one question N times), and the write
+        # side now stores only the trailing pages, so a set derived from local
+        # residency describes something the backend never held.
         window = PoolTransfer(
             name=POOL_WINDOW,
-            keys=[self.key(h) for _, h in resident],
+            keys=[self.key(h) for _, h in pages[-self.window_pages:]],
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         try:
@@ -411,8 +466,8 @@ class DSV4L3Tier:
         # updated are never printed. Diagnosing a cross-restart miss took a
         # full day partly because the one number that settled it was invisible.
         logger.info(
-            "L3 restorable_prefix: asked=%d resident_window=%d -> kv_hit=%d pools=%s",
-            len(pages), len(resident), kv_hit,
+            "L3 restorable_prefix: asked=%d window_trailing=%d -> kv_hit=%d pools=%s",
+            len(pages), self.window_pages, kv_hit,
             getattr(result, "extra_pool_hit_pages", None),
         )
         return min(kv_hit, len(pages))
@@ -439,7 +494,7 @@ class DSV4L3Tier:
             if not subset:
                 continue
             got = 0
-            for chunk in _chunks(subset, self.staging_pages):
+            for chunk in _chunks(subset, self.staging_capacity[pool_name]):
                 got += self._read_chunk(pool_name, chunk)
             report.loaded[pool_name] = got
             if got != len(subset):

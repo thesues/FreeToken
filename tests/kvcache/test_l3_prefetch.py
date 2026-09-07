@@ -19,7 +19,7 @@ from freetoken.kvcache.hicache.dsv4_l3 import DSV4L3Tier
 from freetoken.kvcache.hicache.l3_prefetch import L3Prefetcher, Status
 from freetoken.models.deepseek_v4.args import DeepseekV4Args
 
-from test_dsv4_l3 import FakeStorage, P, RATIOS  # noqa: E402
+from test_dsv4_l3 import FakeStorage, P, RATIOS, _bind  # noqa: E402
 
 DEVICE = torch.device("cpu")
 
@@ -261,3 +261,32 @@ def test_an_empty_hash_list_starts_nothing():
     assert pf.start("r1", []) is False
     assert pf._thread is None
     pf.stop()
+
+
+def test_a_prefix_longer_than_one_fetch_is_capped_not_failed():
+    """The defect the cap exists for.
+
+    `_fetch` allocated the WHOLE restorable prefix from a pool sized in chunks,
+    so any prefix past one chunk raised and the tier counted an error instead of
+    returning the shorter hit it could have served. `max_inflight` bounds
+    fetches and `staging_pages` bounds pages; sizing by one while allocating by
+    the other is the bug, and it is invisible until a prefix gets long.
+    """
+    pool = _pool(num_pages=16)     # room to bind five window pages
+    _bind(pool, 5)
+    st = FakeStorage()
+    tier = DSV4L3Tier(pool, st, staging_pages=4)
+    pages = [(i * P, f"c{i}") for i in range(5)]
+    for i in range(1, len(pages) + 1):
+        assert tier.write_pages(pages[:i]).complete
+
+    pf = L3Prefetcher(tier, deadline_s=30.0, max_inflight=2)
+    try:
+        assert pf.max_pages == 2, "two fetches have to fit the four-page pool"
+        assert pf.start("k", [h for _, h in pages])
+        status, ready = _await(pf, "k")
+        assert status is Status.READY, status
+        assert ready.n_pages == pf.max_pages, ready
+    finally:
+        pf.release("k")
+        pf.stop()

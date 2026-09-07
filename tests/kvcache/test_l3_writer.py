@@ -101,7 +101,7 @@ def test_the_gather_happens_before_submit_returns():
 
         L3Writer._ensure_thread(w)         # now let it drain
         _settle(w)
-        assert st.blobs[tier.key(POOL_FULL, "h0")] == want, (
+        assert st.blobs[(POOL_FULL, tier.key("h0"))] == want, (
             "the stored bytes are the pool's CURRENT contents, so the gather "
             "ran on the writer thread rather than at submit time"
         )
@@ -118,8 +118,8 @@ def test_a_page_outside_the_window_contributes_only_its_history():
     try:
         w.submit([(0, "h0"), (P, "h1")])
         _settle(w)
-        assert tier.key(POOL_FULL, "h0") in st.blobs
-        assert tier.key(POOL_WINDOW, "h0") not in st.blobs
+        assert (POOL_FULL, tier.key("h0")) in st.blobs
+        assert (POOL_WINDOW, tier.key("h0")) not in st.blobs
     finally:
         w.stop()
 
