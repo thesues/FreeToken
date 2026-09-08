@@ -148,10 +148,42 @@ RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
 #
 # `autumn_vllm_loader` is deliberately NOT installed: weights come from the FUSE
 # mount, not from `--load-format autumn`.
+# `--force-reinstall` is not optional, and the reason is not the obvious one.
+# FREETOKEN_IMAGE is a freetoken-autumn image built before autumn was taken out
+# of that image, so the base already carries `autumn 0.1.0` — and the crate
+# version is the constant `0.1.0` in every build. pip, handed a local wheel
+# whose version is already installed, prints "already installed with the same
+# version as the provided wheel" and moves on WITHOUT installing it. The build
+# then succeeds while shipping the base image's older extension.
+#
+# That is not a hypothetical: after the cluster moved to wire v37 this image
+# shipped a v35 client through three green builds, and the only symptom was
+# `decode GetClusterIdResp failed` at runtime, with the L3 tier declining to
+# construct and the engine serving happily without one.
+#
+# The check below is the real guard, because it does not care WHY the wrong
+# extension is in place: it fails the build unless the installed `.so` is
+# byte-identical to the one this build just compiled. `cd /tmp` first so that
+# `import autumn` cannot resolve against the source tree in the build cwd.
 RUN cd python \
  && maturin build --release --interpreter python3 \
- && python3 -m pip install --no-cache-dir target/wheels/autumn-*.whl \
- && python3 -m pip install --no-cache-dir -e autumn_kvcache
+ && python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+      target/wheels/autumn-*.whl \
+ && python3 -m pip install --no-cache-dir -e autumn_kvcache \
+ && cd /tmp \
+ && python3 -c 'import glob,zipfile,hashlib,os,autumn; \
+    w=sorted(glob.glob("/src/python/target/wheels/autumn-*.whl"))[-1]; \
+    z=zipfile.ZipFile(w); \
+    n=[x for x in z.namelist() if x.endswith(".so")][0]; \
+    built=hashlib.md5(z.read(n)).hexdigest(); \
+    p=sorted(glob.glob(os.path.join(os.path.dirname(autumn.__file__),"autumn*.so")))[0]; \
+    got=hashlib.md5(open(p,"rb").read()).hexdigest(); \
+    print("autumn extension: built",built,"installed",got,"at",p); \
+    raise SystemExit(0 if built==got else "the installed autumn extension is not the one this build compiled")' \
+ && mkdir -p /usr/local/share/autumn \
+ && grep -hoE "^pub const WIRE_VERSION_(MIN|MAX): u32 = [0-9]+" \
+      /src/crates/rpc/src/lib.rs > /usr/local/share/autumn/client-wire-version \
+ && cat /usr/local/share/autumn/client-wire-version
 
 # Fail the BUILD, not the first request. `attach_l3` is written so that a tier
 # it cannot construct costs nothing — it logs one line and the engine serves
