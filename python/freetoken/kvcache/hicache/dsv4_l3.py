@@ -221,7 +221,11 @@ class DSV4L3Tier:
         # window tier. One number for both would size the expensive pool by the
         # cheap pool's needs.
         if window_staging_pages is None:
-            window_staging_pages = staging_pages
+            # A caller that says nothing about the window pool is not thinking
+            # about the asymmetry, so give it enough for the default two fetches
+            # in flight rather than the full tier's number, which describes a
+            # whole prefix and has nothing to do with a two-page tail.
+            window_staging_pages = max(staging_pages, self.window_pages * 2)
         if window_staging_pages < 1:
             raise ValueError("need at least one window staging page")
         self.staging_capacity = {

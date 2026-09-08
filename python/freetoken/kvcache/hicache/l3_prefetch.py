@@ -109,11 +109,13 @@ class L3Prefetcher:
         # `staging_pages` counts pages: they are not the same unit, and sizing
         # the pool by one while allocating by the other is why a prefix longer
         # than a chunk failed here with the pool nowhere near full.
-        for pool in (POOL_FULL, POOL_WINDOW):
-            # Both tiers, the same count: a fetch takes the whole prefix from
-            # each. Sizing the window pool by the window WIDTH instead would be
-            # the same units mistake in the other direction.
-            per_fetch = max_pages
+        for pool, per_fetch in ((POOL_FULL, max_pages),
+                                (POOL_WINDOW, tier.window_pages)):
+            # Different counts, because the two tiers carry different things: a
+            # fetch takes the whole prefix from the full tier and only the
+            # trailing pages from the window tier. Demanding `max_pages` of both
+            # is what made the engine refuse to start against a correctly-sized
+            # window pool — 6 pages held, 972 asked for.
             budget = tier.staging_capacity[pool]
             if per_fetch * max_inflight > budget:
                 raise ValueError(

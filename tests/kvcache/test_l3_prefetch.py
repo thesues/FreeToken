@@ -290,3 +290,27 @@ def test_a_prefix_longer_than_one_fetch_is_capped_not_failed():
     finally:
         pf.release("k")
         pf.stop()
+
+
+def test_the_two_staging_pools_are_budgeted_by_what_each_tier_carries():
+    """The pools are sized asymmetrically, so the check must be too.
+
+    A fetch takes the whole prefix from the full tier and only the trailing
+    pages from the window tier, and `attach_l3` sizes them that way — a large
+    full pool against a handful of 17 MiB window pages. Every other tier built
+    in these tests gives both pools the SAME capacity, so a check that demanded
+    `max_pages` of both passed here and then refused to start the engine in
+    production: "dsv4_window staging holds 6 pages but 2 fetches of 486 need
+    972". Ablation: budget the window pool by `max_pages` and this goes red.
+    """
+    from freetoken.kvcache.hicache.dsv4_l3 import window_tail_pages
+    pool = _pool(num_pages=16)
+    tail = window_tail_pages(pool)
+    tier = DSV4L3Tier(pool, FakeStorage(),
+                      staging_pages=20, window_staging_pages=tail * 3,
+                      writer_pages=4, window_writer_pages=tail)
+    pf = L3Prefetcher(tier, max_inflight=2, max_pages=8, deadline_s=30.0)
+    try:
+        assert pf.max_pages == 8, "the full pool was capped by the window one"
+    finally:
+        pf.stop()
