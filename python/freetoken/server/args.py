@@ -433,6 +433,16 @@ def parse_args(
         "a full-size restore, and a value under that means none ever lands.",
     )
     parser.add_argument(
+        "--no-hicache-prefetch-wait",
+        dest="hicache_prefetch_wait",
+        action="store_false",
+        help="Do not hold a request back for a scheduler pass while its L3 "
+        "fetch lands. The wait is only ever taken when nothing else is pending "
+        "and nothing is decoding — which is exactly when a restarted engine "
+        "gets its first message, and without it that fetch is always still in "
+        "flight at admission and the hit goes unused.",
+    )
+    parser.add_argument(
         "--hicache-max-inflight",
         type=int,
         default=2,

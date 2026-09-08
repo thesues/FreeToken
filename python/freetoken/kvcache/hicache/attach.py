@@ -109,6 +109,7 @@ def attach_l3(cache_manager, kv_pool, config) -> bool:
         deadline_s=float(getattr(config, "hicache_prefetch_deadline_s", 6.0)),
         max_inflight=max_inflight,
         max_pages=max_pages,
+        wait_at_admission=bool(getattr(config, "hicache_prefetch_wait", True)),
     )
     # The digests are what L3 names pages by, and computing them costs a hash
     # per page on the scheduler thread — so they are enabled here, with the

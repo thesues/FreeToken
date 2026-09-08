@@ -248,6 +248,35 @@ class PrefillManager:
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
 
+    def _l3_fetch_worth_waiting_for(self, pending_req: PendingReq) -> bool:
+        """Hold this request back one pass while its L3 fetch lands.
+
+        `_start_l3_prefetch` explains why admission cannot wait in general:
+        `schedule_next_batch` breaks on the first request it cannot admit, so a
+        request that waits holds up everything behind it. This is the one shape
+        where that sentence is vacuous — nothing is behind it and nothing is
+        decoding — and it is exactly the shape the tier exists for. The first
+        message of a conversation after a restart arrives on an idle engine, and
+        the fetch is started in the same scheduler pass that admits it, so
+        without this the poll is ALWAYS `WAITING` at admission: the fetch lands,
+        is scored a hit, and is never used. That is what `hits` with no
+        `adopted` was.
+
+        Bounded by the prefetcher's own deadline, not by a sleep here: `poll`
+        turns WAITING into EXPIRED once it passes, and the request is admitted
+        on its L1 prefix like any other.
+        """
+        if pending_req.chunked_req is not None:
+            return False
+        if len(self.pending_list) != 1 or self.decode_manager.running_reqs:
+            return False
+        pf = getattr(self.cache_manager, "l3_prefetcher", None)
+        if pf is None or not getattr(pf, "wait_at_admission", False):
+            return False
+        from freetoken.kvcache.hicache.l3_prefetch import Status
+
+        return pf.poll(pending_req.uid)[0] is Status.WAITING
+
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
             PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
@@ -298,6 +327,8 @@ class PrefillManager:
         log_cached_tokens = 0
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
+            if self._l3_fetch_worth_waiting_for(pending_req):
+                break        # same shape as "cannot admit": retried next pass
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):

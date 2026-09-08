@@ -220,3 +220,63 @@ def test_adoption_extends_a_prefix_l1_already_partly_holds():
     # Returned unlocked: the caller (`_try_allocate_one`) is what locks it, and
     # locking here too leaked a lock and a window page on every adoption.
     assert cm.prefix_cache.full_protected == 0, "adopt left a lock behind"
+
+
+class _FakeDecode:
+    def __init__(self, running=()):
+        self.running_reqs = set(running)
+
+
+def _pending(uid, n_tokens):
+    """What the admission loop actually iterates — not a `Req`."""
+    from freetoken.scheduler.utils import PendingReq
+    return PendingReq(uid, torch.arange(n_tokens, dtype=torch.int32),
+                      SamplingParams())
+
+
+def _prefill_mgr(cm, pending, running=()):
+    """Just the surface `_l3_fetch_worth_waiting_for` reads."""
+    from freetoken.scheduler.prefill import PrefillManager
+    m = PrefillManager.__new__(PrefillManager)
+    m.cache_manager = cm
+    m.decode_manager = _FakeDecode(running)
+    m.pending_list = list(pending)
+    return m
+
+
+def test_a_lone_request_waits_a_pass_for_its_own_fetch():
+    """Otherwise the fetch is ALWAYS still in flight when it is consulted.
+
+    `add_one_req` starts it and the same scheduler pass admits, so on an idle
+    engine the poll is WAITING every time: the fetch lands, is scored a hit, and
+    is never used. Holding the request back costs nothing here because nothing
+    is behind it — which is the only condition under which this is allowed.
+    """
+    cm, pool, _ = _stack()
+    _stocked(cm, pool)
+    req = _pending(11, len(HASHES) * P)
+    pf = cm.l3_prefetcher
+    assert pf.start(req.uid, HASHES)                    # in flight
+    mgr = _prefill_mgr(cm, [req])
+    assert mgr._l3_fetch_worth_waiting_for(req), "a lone request refused to wait"
+
+    _ready(cm, req.uid)                                 # once it lands
+    assert not mgr._l3_fetch_worth_waiting_for(req), "kept waiting after READY"
+    pf.release(req.uid)
+
+
+def test_a_request_with_company_never_waits():
+    """`schedule_next_batch` breaks rather than skips, so waiting with anything
+    queued behind would hold up the whole queue — the 'never add latency' rule
+    broken at the queue level instead of the request level."""
+    cm, pool, _ = _stack()
+    _stocked(cm, pool)
+    req = _pending(12, len(HASHES) * P)
+    other = _pending(13, len(HASHES) * P)
+    pf = cm.l3_prefetcher
+    assert pf.start(req.uid, HASHES)
+    assert not _prefill_mgr(cm, [req, other])._l3_fetch_worth_waiting_for(req), \
+        "waited with a request queued behind it"
+    assert not _prefill_mgr(cm, [req], running=[object()])._l3_fetch_worth_waiting_for(req), \
+        "waited while something was decoding"
+    pf.release(req.uid)

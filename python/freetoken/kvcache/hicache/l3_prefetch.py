@@ -94,6 +94,7 @@ class L3Prefetcher:
         deadline_s: float = 6.0,
         max_inflight: int = 2,
         max_pages: int | None = None,
+        wait_at_admission: bool = True,
     ) -> None:
         # Derived from the tier by default, so the pair cannot be inconsistent
         # by accident: a number chosen here without looking at the pool is what
@@ -123,6 +124,10 @@ class L3Prefetcher:
         self.deadline_s = deadline_s
         self.max_inflight = max_inflight
         self.max_pages = max_pages
+        # Whether the scheduler may hold a request back for a pass while this
+        # fetch lands. Only ever consulted when nothing else is pending and
+        # nothing is decoding — see `_l3_fetch_worth_waiting_for`.
+        self.wait_at_admission = wait_at_admission
         self._entries: dict[object, _Entry] = {}
         self._lock = threading.Lock()
         self._q: queue.Queue = queue.Queue()

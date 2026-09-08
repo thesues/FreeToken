@@ -34,6 +34,7 @@ class SchedulerConfig(EngineConfig):
     hicache_staging_pages: int = 0
     hicache_prefetch_pages: int = 0
     hicache_prefetch_deadline_s: float = 6.0
+    hicache_prefetch_wait: bool = True
     hicache_max_inflight: int = 2
     hicache_write_queue_bytes: int = 512 << 20
     offline_mode: bool = False
