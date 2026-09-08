@@ -434,3 +434,39 @@ def test_a_page_that_vanishes_between_the_check_and_the_read_stops_the_prefix():
     assert torch.equal(tier2.codec.gather(2 * P, POOL_FULL), untouched), (
         "page 2 was scattered in despite page 1 being missing"
     )
+
+
+def test_the_window_tail_is_two_pages_not_the_pool():
+    """The sidecar's trailing count describes the SEQUENCE, not the pool.
+
+    It was the window pool's capacity, which is wider than any prefix — so
+    `lo = max(0, prefix_len - trailing)` was always 0 and TRAILING_PAGES
+    degenerated into ALL_PAGES anchored at the head.
+    """
+    from freetoken.kvcache.hicache.dsv4_l3 import window_tail_pages
+    pool = _pool()
+    assert pool.sliding_window_size == P
+    assert window_tail_pages(pool) == 2
+    assert window_tail_pages(pool) < pool.window_pool[0].shape[0] // P
+
+
+def test_a_missing_window_page_at_the_head_does_not_shorten_the_prefix():
+    """Only the tail has to carry window rows.
+
+    Every page ahead of the window is tombstoned on insert and reads the
+    sentinel row, so its window blob is never read back. Requiring it made one
+    old page anywhere near the front zero an otherwise perfect prefix — which is
+    exactly what production showed: `kv_hit=0 pools={'PoolName.KV': 55}`.
+    """
+    pool = _pool()
+    _bind(pool, 4)
+    st = FakeStorage()
+    tier = _tier(pool, st, staging_pages=8)
+    pages = [(i * P, f"w{i}") for i in range(4)]
+    for i in range(1, len(pages) + 1):
+        assert tier.write_pages(pages[:i]).complete
+    del st.blobs[(POOL_WINDOW, tier.key("w0"))]      # the head loses its window
+    assert tier.restorable_prefix(pages) == 4, "a head hole must not matter"
+
+    del st.blobs[(POOL_WINDOW, tier.key("w3"))]      # now the tail loses one
+    assert tier.restorable_prefix(pages) == 3, "a tail hole shortens to the cut"

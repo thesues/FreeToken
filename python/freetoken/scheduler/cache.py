@@ -309,60 +309,78 @@ class CacheManager:
         status, ready = pf.poll(req.uid)
         try:
             if status is not Status.READY or ready is None:
-                # WAITING is the interesting one: leave the fetch running and
-                # take the L1 prefix now. If it lands before a later chunk of
-                # this same request is admitted, that chunk gets it.
+                # Not ready in the iteration that admits the request. The fetch
+                # is started by `add_one_req` and polled here in the SAME loop
+                # pass, so on an idle engine this is the normal outcome, not an
+                # edge — and it is why the tier looked like it was hitting and
+                # adopting nothing.
+                if status is Status.WAITING:
+                    pf.tier.stats.bump(late=1)
                 return handle, handle.cached_len
             have = handle.cached_len // self.page_size
             if ready.n_pages <= have:
                 # A hit that bought nothing: L1 already covered it. Worth
                 # counting apart from a miss — it says the tier is working and
                 # the prefetch was unnecessary, which is a different fix.
+                pf.tier.stats.bump(redundant=1)
                 return handle, handle.cached_len
             gained = ready.n_pages - have
             try:
                 # Token-granular, exactly as `allocate_paged` does it.
                 # `_allocate` hands back PAGE bases, while everything downstream
                 # works in token slots: the page-table splice in
-                # `_commit_l3_prefix`, and `_free`'s `page_size` stride. Testing
-                # a page count against a token count rejected every fetch that
-                # ever arrived, and `_free` then handed back one slot in
-                # `page_size` of what it had been given.
+                # `_commit_l3_prefix`, and `_free`'s `page_size` stride.
                 pages = self._page_to_token(self._allocate(gained))
             except AssertionError:
                 # `_allocate` asserts when eviction cannot free enough; it never
                 # returns empty-handed. No room is not an error — the request
                 # proceeds on L1, which is what it would have done without a
                 # tier.
+                pf.tier.stats.bump(no_room=1)
                 return handle, handle.cached_len
+
+            # Two phases with different owners. Up to `insert` the pages are
+            # this method's and a failure must return them; after `insert` the
+            # TREE owns them and returning them would be a double free.
+            tail = pf.tier.window_pages * self.page_size
             try:
                 if self.swa_paged:
-                    # The whole restored prefix, exactly as `allocate_paged`
-                    # binds a freshly prefilled one. Its window rows were all
-                    # fetched, so they all have somewhere to land — and they
-                    # have to: a page left unbound goes into the tree as a
-                    # tombstone, and a tombstoned prefix does not match, so the
-                    # next request would reprefill everything this just restored.
+                    # Only the trailing window's worth. Everything older is
+                    # tombstoned on insert and reads the sentinel row, which is
+                    # the state a long prefix lives in during normal serving —
+                    # binding the whole thing would hold ~17 MiB of window pool
+                    # per page for rows no kernel ever reads, and past ~60 pages
+                    # it starves the request's own chunk.
+                    live = pages[-tail:]
                     if self.is_swa:
-                        self.ensure_swa_slots(len(pages))
-                    self.swa_pool.alloc_swa(pages)
+                        self.ensure_swa_slots(len(live))
+                    self.swa_pool.alloc_swa(live)
                 self._scatter_l3_pages(ready, have, pages)
-                out = self._commit_l3_prefix(req, handle, pages, ready.n_pages)
-                pf.tier.stats.bump(adopted=1, pages_adopted=gained)
-                return out
             except Exception:  # noqa: BLE001
-                # Must be able to fail without taking a request with it: give
-                # the slots back — both pools, since the tail may already be
-                # bound — and admit on the L1 prefix, the no-L3 behaviour.
-                logger.exception("L3 prefix adoption failed; admitting on L1 alone")
+                logger.exception("L3 prefix restore failed; admitting on L1 alone")
+                pf.tier.stats.bump(adopt_errors=1)
                 self._free_swa(pages)
                 self._free(pages)
                 return handle, handle.cached_len
+
+            out = self._commit_l3_prefix(req, handle, pages, ready.n_pages)
+            new_handle, new_cached = out
+            # What the tree actually took, not what was offered. A commit that
+            # lands short is a real outcome — the matcher needs a live run of a
+            # whole page at the end — and reporting `gained` here is how a
+            # restore that moved every byte and matched nothing was counted as
+            # a success.
+            adopted_pages = max(0, (new_cached - handle.cached_len) // self.page_size)
+            if adopted_pages < gained:
+                pf.tier.stats.bump(adopt_short=1)
+            pf.tier.stats.bump(adopted=1, pages_adopted=adopted_pages)
+            return out
         finally:
-            # Once, whatever happened. A fetch never released holds its staging
-            # slots forever and the pool drains one request at a time.
-            if status is not Status.WAITING:
-                pf.release(req.uid)
+            # Unconditionally. Releasing only on a terminal status left every
+            # WAITING fetch holding its staging slots for the life of the
+            # process: nothing polls this uid again, because continuation chunks
+            # never reach `_try_allocate_one`.
+            pf.release(req.uid)
 
     def _scatter_l3_pages(self, ready, first_page: int, device_pages) -> None:
         """Copy the fetched pages out of staging and into the device pool."""
@@ -405,23 +423,33 @@ class CacheManager:
         # had come from the tree and stay where they are. `insert` reconciles
         # the two and hands back the tree's canonical slots.
         have = handle.cached_len
+        # From the HANDLE, not the page table. `req` here is a `PendingReq`,
+        # which has no `table_idx` — that is assigned later, at admission — so
+        # this raised for every adoption on top of a non-empty L1 prefix. Only
+        # `have == 0` short-circuited it, which is the one case that ever ran.
         combined = torch.cat([
-            self.page_table[req.table_idx, :have] if have else pages[:0],
+            handle.get_matched_indices() if have else pages[:0],
             pages,
         ])
-        # Nothing is tombstoned: every restored page got its window rows back
-        # and a live swa slot to hold them, which is the same state a freshly
-        # prefilled prefix is committed in (`_cache_req_swa` passes the
-        # request's own free frontier, and a single-chunk prefill has not freed
-        # any). Tombstoning instead would insert the prefix unmatchable — the
-        # restore would move every byte and buy the next request nothing.
+        # Everything but the trailing window goes in tombstoned, matching what
+        # the restore actually holds: only those pages were given swa slots.
+        # A tombstoned prefix still matches — `match_prefix` walks the full-pool
+        # path and only requires a live run of one whole page at the END — so
+        # this costs nothing in reuse and keeps the tree honest about which
+        # slots exist.
+        tail_tokens = (self.l3_prefetcher.tier.window_pages * self.page_size
+                       if self.swa_paged else 0)
+        evicted = max(0, n_tokens - tail_tokens)
         _, freed = self.prefix_cache.insert(
-            ids, combined, swa_evicted_seqlen=0, update_kv_after_len=have)
+            ids, combined, swa_evicted_seqlen=evicted, update_kv_after_len=have)
         self._free_swa(freed)
         self._free(freed)
-        self.unlock(handle)
+        # Neither unlock nor lock. `match_req` does not lock, so the handle this
+        # was given was never locked, and `_try_allocate_one` locks whatever
+        # comes back — so locking here left one full lock and a window page per
+        # adoption behind forever, and the unlock asserted on a handle that had
+        # no lock to release.
         new_handle = self.match_req(req).cuda_handle
-        self.lock(new_handle)
         return new_handle, new_handle.cached_len
 
     def cache_req(self, req: Req, *, finished: bool) -> None:

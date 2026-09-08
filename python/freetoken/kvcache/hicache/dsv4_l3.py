@@ -71,7 +71,12 @@ class L3Stats:
                  "declined", "errors", "pages_offered", "pages_adopted",
                  "bytes_read", "writes", "pages_stored", "pages_present",
                  "pages_no_window", "bytes_written", "write_failures",
-                 "write_drops")
+                 "write_drops",
+                 # Why an offered hit was not adopted. `adopted=0` next to
+                 # `hits>0` used to conflate five different outcomes, one of
+                 # which (a commit that returned a shorter prefix than it
+                 # claimed) was being reported as a success.
+                 "late", "redundant", "no_room", "adopt_errors", "adopt_short")
 
     def __init__(self) -> None:
         import threading
@@ -101,6 +106,9 @@ class L3Stats:
             f"miss={d['misses']} expired={d['expired']} declined={d['declined']} "
             f"errors={d['errors']} | pages offered={d['pages_offered']} "
             f"adopted={d['pages_adopted']} | read={d['bytes_read'] / 2**20:.1f} MiB | "
+            f"not-adopted: late={d['late']} redundant={d['redundant']} "
+            f"no-room={d['no_room']} err={d['adopt_errors']} "
+            f"short={d['adopt_short']} | "
             f"writes={d['writes']} pages stored={d['pages_stored']} "
             f"present={d['pages_present']} no-window={d['pages_no_window']} "
             f"wrote={d['bytes_written'] / 2**20:.1f} MiB "
@@ -158,21 +166,28 @@ class WriteReport:
         return "; ".join(parts)
 
 
-def window_pages_for(pool) -> int:
-    """Trailing pages of a prefix that can carry window rows.
+def window_tail_pages(pool) -> int:
+    """Trailing pages of a prefix that must carry window rows.
 
-    The window POOL's capacity, not `sliding_window_size`. The latter is 128
-    tokens on DSV4 and reads like the answer, but it is the per-step attention
-    span, not what stays bound: DSV4 prefills in a single chunk and the
-    out-of-window unbind runs when the NEXT chunk is prepared, so at commit the
-    whole prefix is still window-resident and every page of it is stored.
+    Two, and both halves of that matter.
 
-    That is not a detail — it decides whether a restored prefix is reusable at
-    all. Tokens whose swa slots are sentinel go into the tree as tombstones, and
-    a tombstoned prefix does not match, so restoring only a tail would move the
-    bytes and still leave the next request to reprefill from zero.
+    One is the window itself: `sliding_window_size` is P, so exactly one page
+    of a sequence is bound at any time and everything older is tombstoned out
+    of it — which is fine, because a tombstoned prefix DOES match. What the
+    matcher requires is a live run of at least one full page at the END
+    (`SWARadixCache.match_prefix`), not a tombstone-free path.
+
+    The second page pays for the token the matcher drops. `match_req` matches
+    `input_ids[:input_len - 1]`, so a page-aligned prompt offers 127 tokens of
+    its own last page, `align_down(127, P)` is 0, and a one-page tail matches
+    nothing. The engine's own finish-time retention keeps the same two pages.
+
+    This was the pool's capacity (98) until it was measured. That made the
+    sidecar's TRAILING_PAGES window wider than any prefix, so `lo` was always 0
+    and the policy degenerated into ALL_PAGES anchored at the head: one page
+    missing its window rows anywhere near the front zeroed the whole prefix.
     """
-    return max(1, pool.window_pool[0].shape[0] // pool.P)
+    return max(1, -(-pool.sliding_window_size // pool.P) + 1)
 
 
 class DSV4L3Tier:
@@ -200,7 +215,7 @@ class DSV4L3Tier:
         # MiB per page. Everything older keeps its full tier and is tombstoned
         # out of the window on insert, so its window rows are never read back
         # even when they were stored.
-        self.window_pages = window_pages_for(pool)
+        self.window_pages = window_tail_pages(pool)
         # Per pool, because the two are wanted in wildly different quantities: a
         # fetch takes a long prefix from the full tier and a fixed tail from the
         # window tier. One number for both would size the expensive pool by the

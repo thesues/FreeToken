@@ -138,3 +138,50 @@ def test_a_failed_adoption_returns_every_slot_it_took():
     assert len(cm.free_slots) == before, (
         f"leaked {before - len(cm.free_slots)} of {len(HASHES)} pages"
     )
+
+
+def test_a_fetch_that_was_not_ready_yet_gives_its_staging_back():
+    """The leak that made the tier look like it hit and adopted nothing.
+
+    `add_one_req` starts the fetch and the SAME scheduler pass polls it, so on
+    an idle engine WAITING is the normal answer. Releasing only on a terminal
+    status left the entry — and its staging slots — held for the life of the
+    process, because continuation chunks never reach `_try_allocate_one` and
+    nothing polls that uid again. Ablation: gate the release on
+    `status is not Status.WAITING` and this goes red.
+    """
+    cm, pool, _ = _stack()
+    _stocked(cm, pool)
+    req = _req(7, len(HASHES) * P)
+    pf = cm.l3_prefetcher
+    assert pf.start(req.uid, HASHES)          # in flight, not yet ready
+
+    handle = cm.match_req(req).cuda_handle
+    cm.adopt_l3_prefix(req, handle)           # polls WAITING and must let go
+    assert req.uid not in pf._entries, "the fetch was left holding its slots"
+
+    # And the pool is whole again: a second fetch of the same size can be made.
+    for name, host in pf.tier.staging.items():
+        got = host.alloc(pf.max_pages * pool.P)
+        assert got is not None, f"{name} staging never came back"
+        host.free(got)
+
+
+def test_one_trailing_page_is_not_enough_to_match():
+    """Why the window tail is two pages and not one.
+
+    `match_req` matches `input_ids[:input_len - 1]`, so a page-aligned prompt
+    offers 127 tokens of its own last page and `align_down(127, P)` is 0. With a
+    one-page tail the live run at the end is under a page, the matcher commits
+    nothing, and the restore moves every byte for no reuse. This is the ablation
+    for `window_tail_pages` returning 2.
+    """
+    cm, pool, _ = _stack()
+    tier = _stocked(cm, pool)
+    tier.window_pages = 1                     # the value this used to compute
+    req = _req(8, len(HASHES) * P)
+    status, _ = _ready(cm, req.uid)
+    assert status is Status.READY
+    handle = cm.match_req(req).cuda_handle
+    _, cached = cm.adopt_l3_prefix(req, handle)
+    assert cached == 0, f"a one-page tail should match nothing, got {cached}"

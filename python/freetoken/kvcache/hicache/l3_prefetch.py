@@ -238,11 +238,16 @@ class L3Prefetcher:
                     if ready:
                         # Counted here rather than at the fetch, so a result the
                         # scheduler had already abandoned is not scored a hit.
+                        # Every page carries history; only the tail carries
+                        # window rows. Charging both tiers for every page turned
+                        # a ~45 MiB fetch into a reported 803 MiB — a number
+                        # that then got used to reason about bandwidth.
+                        win = min(ready.n_pages, self.tier.window_pages)
                         self.tier.stats.bump(
                             hits=1, pages_offered=ready.n_pages,
-                            bytes_read=ready.n_pages * (
-                                self.tier.codec.full_page_bytes
-                                + self.tier.codec.window_page_bytes),
+                            bytes_read=(
+                                ready.n_pages * self.tier.codec.full_page_bytes
+                                + win * self.tier.codec.window_page_bytes),
                         )
                     else:
                         self.tier.stats.bump(misses=1)

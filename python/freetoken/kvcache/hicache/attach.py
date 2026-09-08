@@ -21,7 +21,7 @@ import json
 import logging
 from freetoken.utils.logger import init_logger
 
-from .dsv4_l3 import DSV4L3Tier, window_pages_for
+from .dsv4_l3 import DSV4L3Tier, window_tail_pages
 from .l3_prefetch import L3Prefetcher
 from .l3_writer import L3Writer
 
@@ -50,15 +50,13 @@ def attach_l3(cache_manager, kv_pool, config) -> bool:
         storage = _load_backend(config)
         # The longest prefix worth fetching is bounded by the device pool it
         # has to land in: `full_to_window` carries one entry per full token
-        # slot, so its length in pages is that bound.
+        # slot, so its length in pages is that bound. It is NOT bounded by the
+        # window pool — only the trailing `window_pages` need window rows, and
+        # everything ahead of them is restored as history and tombstoned, which
+        # is the state a long prefix lives in anyway.
         pool_pages = max(1, kv_pool.full_to_window.numel() // kv_pool.P)
-        window_pages = window_pages_for(kv_pool)
-        # Bounded by the window pool, not the full pool. A prefix longer than
-        # the window tier can cover comes back with its head unbound, goes into
-        # the tree tombstoned, and matches nothing — all of the transfer cost
-        # and none of the benefit.
-        max_pages = int(getattr(config, "hicache_prefetch_pages", 0)
-                        or min(pool_pages, window_pages))
+        window_pages = window_tail_pages(kv_pool)
+        max_pages = int(getattr(config, "hicache_prefetch_pages", 0) or pool_pages)
         max_inflight = int(getattr(config, "hicache_max_inflight", 2))
         # The writer allocates from the same pools as the prefetcher, so it gets
         # a reserved share rather than competing for one: fetches in flight
@@ -80,13 +78,17 @@ def attach_l3(cache_manager, kv_pool, config) -> bool:
                 )
                 max_pages = fits
         staging_pages = max_pages * max_inflight + writer_full
+        # The window pool is sized by the TAIL, not by the prefix. A window page
+        # is ~17 MiB against the full page's ~0.8, so sizing both alike bought
+        # ~3.8 GiB of pinned host memory to hold rows nothing ever reads.
+        window_staging = window_pages * (max_inflight + 1)
 
         tier = DSV4L3Tier(
             kv_pool, storage,
             staging_pages=staging_pages,
-            window_staging_pages=staging_pages,
+            window_staging_pages=window_staging,
             writer_pages=writer_full,
-            window_writer_pages=writer_full,
+            window_writer_pages=window_pages,
         )
     except Exception:  # noqa: BLE001
         logger.exception("could not build the L3 tier; continuing without one")
@@ -115,13 +117,13 @@ def attach_l3(cache_manager, kv_pool, config) -> bool:
 
     logger.info(
         "L3 tier attached: %s, page %d bytes full / %d bytes window, layout %s"
-        "; prefetch <=%d pages x%d inflight, staging %d pages per tier "
-        "(%.0f MiB)",
+        "; prefetch <=%d pages x%d inflight, window tail %d, staging %d full "
+        "+ %d window (%.0f MiB)",
         type(storage).__name__, tier.codec.full_page_bytes,
         tier.codec.window_page_bytes, tier.codec.layout_signature,
-        max_pages, max_inflight, staging_pages,
-        staging_pages * (tier.codec.full_page_bytes
-                         + tier.codec.window_page_bytes) / (1 << 20),
+        max_pages, max_inflight, window_pages, staging_pages, window_staging,
+        (staging_pages * tier.codec.full_page_bytes
+         + window_staging * tier.codec.window_page_bytes) / (1 << 20),
     )
     return True
 
