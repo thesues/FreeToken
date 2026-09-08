@@ -185,3 +185,38 @@ def test_one_trailing_page_is_not_enough_to_match():
     handle = cm.match_req(req).cuda_handle
     _, cached = cm.adopt_l3_prefix(req, handle)
     assert cached == 0, f"a one-page tail should match nothing, got {cached}"
+
+
+def test_adoption_extends_a_prefix_l1_already_partly_holds():
+    """The only shape that exercises the commit's page-table splice.
+
+    `have == 0` short-circuits it, and that is the one case that ever ran — so
+    three bugs sat in this path unseen: it read `req.table_idx` from a
+    `PendingReq`, which has no such field; it unlocked a handle `match_req`
+    never locked, which asserts AFTER `insert` has taken the pages; and it
+    locked the handle that `_try_allocate_one` locks again.
+
+    Ablation: splice from `self.page_table[req.table_idx]` and this goes red
+    (AttributeError -> the request falls back to its L1 prefix).
+    """
+    cm, pool, _ = _stack()
+    _stocked(cm, pool)
+    req = _req(9, len(HASHES) * P)
+
+    # Seed L1 with the first page, so the adoption has to extend rather than
+    # start from nothing.
+    seed = cm._page_to_token(cm._allocate(1))
+    cm.ensure_swa_slots(len(seed))
+    cm.swa_pool.alloc_swa(seed)
+    cm.prefix_cache.insert(req.input_ids[:P], seed,
+                           swa_evicted_seqlen=0, update_kv_after_len=0)
+    handle = cm.match_req(req).cuda_handle
+    assert handle.cached_len == P, f"L1 seed did not take: {handle.cached_len}"
+
+    status, ready = _ready(cm, req.uid)
+    assert status is Status.READY and ready.n_pages == len(HASHES)
+    new_handle, cached = cm.adopt_l3_prefix(req, handle)
+    assert cached == (len(HASHES) - 1) * P, f"extended to {cached}, not 256"
+    # Returned unlocked: the caller (`_try_allocate_one`) is what locks it, and
+    # locking here too leaked a lock and a window page on every adoption.
+    assert cm.prefix_cache.full_protected == 0, "adopt left a lock behind"

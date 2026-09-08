@@ -363,7 +363,18 @@ class CacheManager:
                 self._free(pages)
                 return handle, handle.cached_len
 
-            out = self._commit_l3_prefix(req, handle, pages, ready.n_pages)
+            try:
+                out = self._commit_l3_prefix(req, handle, pages, ready.n_pages)
+            except Exception:  # noqa: BLE001
+                # Deliberately does NOT free. `insert` may already have taken
+                # these pages into the tree, and this side cannot tell from
+                # here whether it did — so the choice is a possible leak or a
+                # possible double free, and a double free hands live pages to
+                # the next request. Leak, and say so loudly.
+                logger.exception("L3 commit failed after the restore landed; "
+                                 "pages left to the tree, admitting on L1")
+                pf.tier.stats.bump(adopt_errors=1)
+                return handle, handle.cached_len
             new_handle, new_cached = out
             # What the tree actually took, not what was offered. A commit that
             # lands short is a real outcome — the matcher needs a live run of a
