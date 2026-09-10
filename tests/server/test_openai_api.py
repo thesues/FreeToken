@@ -444,6 +444,59 @@ def test_models_route_publishes_the_model_context_length():
     assert card["context_length"] == 262144
 
 
+def test_models_route_caps_the_context_length_at_the_kv_pool():
+    """The number an agent sizes its context off must be one the scheduler will accept.
+
+    A prompt above `num_pages * page_size` is dropped after its prefill is already paid for
+    ("prompt is too long: N tokens > M maximum"), so publishing the bare model ceiling over a
+    much smaller pool makes every long conversation fail. These are a live server's numbers: a
+    1M-token ceiling in front of a 485-page x 128 pool.
+
+    `state.config.page_size` is deliberately the *wrong* 64 here, as it is in production: DSV4
+    rewrites page_size to the window page P inside the engine's config, and the frontend's copy
+    never learns. Reading it instead of the pool's own page_size halves the answer."""
+    state = FakeState([])
+    state.config.max_seq_len = 1048576
+    state.config.page_size = 64
+    state.cache_pools = {"num_pages": 485, "page_size": 128}
+
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    card = TestClient(app).get("/v1/models").json()["data"][0]
+
+    assert card["max_model_len"] == 62080
+    assert card["context_length"] == 62080
+
+
+def test_models_route_keeps_the_model_ceiling_when_the_pool_is_larger():
+    """The cap is a min, not a replacement: a pool with room to spare cannot raise the ceiling
+    the model itself imposes."""
+    state = FakeState([])
+    state.config.max_seq_len = 8192
+    state.cache_pools = {"num_pages": 485, "page_size": 128}
+
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    assert TestClient(app).get("/v1/models").json()["data"][0]["context_length"] == 8192
+
+
+def test_models_route_prefers_the_last_rebuild_geometry_over_the_load_seed():
+    """A rebuild moves the pool; the seed captured at load is then stale. Same precedence the
+    rebuild and stats routes use, so the three cannot disagree about how big the pool is."""
+    state = FakeState([])
+    state.config.max_seq_len = 1048576
+    state.cache_pools = {"num_pages": 485, "page_size": 128}
+    state.stats = SimpleNamespace(kv_total_pages=485)
+    state.last_rebuild = {"num_pages": 700}
+
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    assert TestClient(app).get("/v1/models").json()["data"][0]["context_length"] == 89600
+
+
 async def _collect(generator):
     return [chunk async for chunk in generator]
 

@@ -676,11 +676,45 @@ def _served_model_name(state: Any) -> str:
     return getattr(state.config, "served_model_name", None) or state.config.model_path
 
 
+def _servable_seq_len(state: Any) -> int | None:
+    """Tokens the KV pool can actually hold — `num_pages * page_size`, the same product the
+    engine takes the min with when it sets its own `max_seq_len`. Resolved the way the rebuild
+    and stats routes resolve it: the last rebuild's geometry first, then what the ack path
+    reported, then the load-time seed. None when no pool geometry has arrived yet."""
+    last = getattr(state, "last_rebuild", None) or {}
+    pools = getattr(state, "cache_pools", None) or {}
+    tracker = getattr(state, "stats", None)
+    num_pages = int(
+        last.get("num_pages")
+        or getattr(tracker, "kv_total_pages", 0)
+        or pools.get("num_pages", 0)
+        or 0
+    )
+    if num_pages <= 0:
+        return None
+    page_size = int(pools.get("page_size", 0) or getattr(state.config, "page_size", 1) or 1)
+    total = num_pages * page_size
+    return total if total > 0 else None
+
+
 def _model_context_length(state: Any) -> int | None:
-    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
-    read this once at startup."""
+    """What a request may actually use: `min(model ceiling, KV pool capacity)`.
+
+    The pool is normally the smaller of the two, and it is the number the scheduler enforces —
+    a prompt above it is dropped *after* its prefill is already paid for, with "prompt is too
+    long: N tokens > M maximum". Publishing the bare model ceiling here sends every agent that
+    sizes its context off this route into exactly that rejection, and the gap is not a rounding
+    error: a 1M-token ceiling over a 62080-token pool is 17x.
+
+    A rebuild can move the pool afterwards, but only one direction of staleness hurts: an agent
+    that cached the smaller number leaves capacity unused, while one that cached the ceiling
+    fails every long conversation. Falls back to the ceiling while the pool geometry is still
+    unknown, which is the only number available that early."""
     try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001
         return None
+    servable = _servable_seq_len(state)
+    if servable is not None:
+        value = min(value, servable)
     return value if value > 0 else None
