@@ -20,16 +20,24 @@
 #
 # ── ⚠ This image is back under the WIRE lockstep ──────────────────────────────
 # The production image is free of it; this one is not. It embeds autumn's rkyv
-# client, so AUTUMN_IMAGE MUST name the same commit as the cluster's running
-# autumn-rs. A mismatch does not fail the handshake — it decodes garbage, or
-# fails at the first RPC with a wire-version error. Check before building:
+# client, so the autumn image below MUST name the same commit as the cluster's
+# running autumn-rs. A mismatch does not fail the handshake — it decodes
+# garbage, or fails at the first RPC with a wire-version error. Check with:
 #
 #   kubectl -n autumn get sts autumn-ps \
 #     -o jsonpath='{.spec.template.spec.containers[0].image}'
 #
+# The pin lives in this file, as AUTUMN_IMAGE_PIN, and a wire bump is a commit
+# here. It used to live in the CP pipeline's buildParams, which was the wrong
+# place twice over: the CP API has no update-pipeline call (only list / run /
+# cancel / delete / webhook), so moving the pin meant a console visit no review
+# ever saw, and the repo could not tell which autumn its own image carried.
+# The pipeline still passes a stale `--build-arg AUTUMN_IMAGE=…`; buildkit
+# warns that nothing consumes it and ignores it, which is the intent.
+#
 #   docker build -f docker/Dockerfile.freetoken-l3 \
 #     --build-arg FREETOKEN_IMAGE=<cr>/freetoken-autumn:<tag> \
-#     --build-arg AUTUMN_IMAGE=<cr>/autumn-rs:<cluster's commit> \
+#     --build-arg AUTUMN_IMAGE_PIN=<cr>/autumn-rs:<cluster's commit> \
 #     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
 #     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
 #     -t <cr>/freetoken-l3:<tag> .
@@ -38,12 +46,12 @@
 # Hub CUDA image with a pull-through cache, both images below are full paths in
 # our own registry. Prefixing them would name a repository that does not exist.
 ARG FREETOKEN_IMAGE=freetoken-autumn:latest
-ARG AUTUMN_IMAGE=autumn-rs:latest
+ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:d3568304480dcfef13e78ef269e4032336faac23
 
 # Sources only. The binaries stay where they are: `autumn-fuse` still comes out
 # of the autumn-rs image via the pod's initContainer, so the mount is a deploy-
 # time choice here exactly as it is for the production image.
-FROM ${AUTUMN_IMAGE} AS autumncore
+FROM ${AUTUMN_IMAGE_PIN} AS autumncore
 
 FROM ${FREETOKEN_IMAGE}
 
