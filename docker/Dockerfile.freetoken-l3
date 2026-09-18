@@ -46,7 +46,7 @@
 # Hub CUDA image with a pull-through cache, both images below are full paths in
 # our own registry. Prefixing them would name a repository that does not exist.
 ARG FREETOKEN_IMAGE=freetoken-autumn:latest
-ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:7626d9a23c1798fa4e1d51c0fcf49a8214f694b9
+ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:aef13927e85e200ad314ff5ddaed926e442d6c75
 
 # Sources only. The binaries stay where they are: `autumn-fuse` still comes out
 # of the autumn-rs image via the pod's initContainer, so the mount is a deploy-
@@ -79,6 +79,25 @@ ENV CARGO_HOME=/root/.cargo \
 # maturin need.
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
  && python3 -m pip install --no-cache-dir --upgrade "maturin>=1,<2"
+
+# The wheel's Cargo.toml carries a `[patch.crates-io]` pointing the compio family
+# at a fork (it holds the fix for a driver that closes the socket its own
+# fallback just made — without it the L3 tier dies at construction with
+# `Bad file descriptor`). That makes `maturin build` below fetch from github,
+# which the CN build pool cannot reach: this image's source arrives as build
+# context through CP, but cargo's own fetch has no such help.
+#
+# GITHUB_MIRROR rewrites github URLs for git, and CARGO_NET_GIT_FETCH_WITH_CLI
+# makes cargo shell out to `git` so the rewrite applies at all — its bundled
+# libgit2 fetcher does not read `insteadOf`. Set it empty to go direct:
+#   --build-arg GITHUB_MIRROR=
+# Goes away with the patch section it exists for.
+ARG GITHUB_MIRROR=https://ghproxy.net/https://github.com/
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN if [ -n "$GITHUB_MIRROR" ]; then \
+      git config --global url."$GITHUB_MIRROR".insteadOf https://github.com/ \
+      && echo "github via $GITHUB_MIRROR"; \
+    fi
 
 # ── FreeToken, from the build context ─────────────────────────────────────────
 # The pipeline's code source IS this repository (thesues/FreeToken@hicache-autumn),
