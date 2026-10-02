@@ -208,7 +208,7 @@ RUN cd python \
     print("autumn extension: built",built,"installed",got,"at",p); \
     raise SystemExit(0 if built==got else "the installed autumn extension is not the one this build compiled")' \
  && mkdir -p /usr/local/share/autumn \
- && grep -hoE "^pub const WIRE_VERSION_(MIN|MAX): u32 = [0-9]+" \
+ && grep -hoE "^pub const (MIN_CLIENT_WIRE_VERSION|WIRE_VERSION): u32 = [0-9]+" \
       /src/crates/rpc/src/lib.rs > /usr/local/share/autumn/client-wire-version \
  && cat /usr/local/share/autumn/client-wire-version
 
