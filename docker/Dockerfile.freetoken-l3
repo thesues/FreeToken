@@ -46,7 +46,7 @@
 # Hub CUDA image with a pull-through cache, both images below are full paths in
 # our own registry. Prefixing them would name a repository that does not exist.
 ARG FREETOKEN_IMAGE=freetoken-autumn:latest
-ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:7900c79baf69f03d83a5c93d25eacdc098a94673
+ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:041d9c8b734dfea9ff10a5749957f71699a3ffd7
 
 # Sources only. The binaries stay where they are: `autumn-fuse` still comes out
 # of the autumn-rs image via the pod's initContainer, so the mount is a deploy-
