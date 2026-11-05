@@ -46,6 +46,7 @@
 # Hub CUDA image with a pull-through cache, both images below are full paths in
 # our own registry. Prefixing them would name a repository that does not exist.
 ARG FREETOKEN_IMAGE=freetoken-autumn:latest
+ARG FREETOKEN_BASE=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/freetoken-l3:640210dc400d96c48fff5418e591bed087ddb6a6
 ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:976012c4807a4ed01562b96dbb85565d188eae30
 
 # Sources only. The binaries stay where they are: `autumn-fuse` still comes out
@@ -58,7 +59,6 @@ FROM ${AUTUMN_IMAGE_PIN} AS autumncore
 # buildParams. Start from the last freetoken-l3 instead, under a name the
 # pipeline does not pass: every step below force-reinstalls freetoken and the
 # autumn client and removes its build output, so the result is the same.
-ARG FREETOKEN_BASE=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/freetoken-l3:640210dc400d96c48fff5418e591bed087ddb6a6
 FROM ${FREETOKEN_BASE}
 
 # ── Mirror knobs (override for China / air-gapped builds) ─────────────────────
