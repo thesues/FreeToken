@@ -48,6 +48,10 @@
 ARG FREETOKEN_IMAGE=freetoken-autumn:latest
 ARG FREETOKEN_BASE=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/freetoken-l3:640210dc400d96c48fff5418e591bed087ddb6a6
 ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:976012c4807a4ed01562b96dbb85565d188eae30
+# The sglang/vLLM adapters live in their own repository since autumn-rs cc2330a3;
+# its AUTUMN_REV file names the autumn-rs commit it was written against, and
+# that must equal AUTUMN_IMAGE_PIN.
+ARG AUTUMN_KVCACHE_REV=c171a3007ca363df64b7fbc1e7b99a2de9c1cc95
 
 # Sources only. The binaries stay where they are: `autumn-fuse` still comes out
 # of the autumn-rs image via the pod's initContainer, so the mount is a deploy-
@@ -60,6 +64,7 @@ FROM ${AUTUMN_IMAGE_PIN} AS autumncore
 # pipeline does not pass: every step below force-reinstalls freetoken and the
 # autumn client and removes its build output, so the result is the same.
 FROM ${FREETOKEN_BASE}
+ARG AUTUMN_KVCACHE_REV
 
 # ── Mirror knobs (override for China / air-gapped builds) ─────────────────────
 #   RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT : rustup TOOLCHAIN download mirror.
@@ -202,7 +207,10 @@ RUN cd python \
  && maturin build --release --interpreter python3 \
  && python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
       target/wheels/autumn-*.whl \
- && python3 -m pip install --no-cache-dir -e autumn_kvcache \
+ && python3 -m pip uninstall -y autumn-kvcache \
+ && rm -rf /src/python/autumn_kvcache \
+ && python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+      "git+https://github.com/journeymidnight/autumn_kvcache@${AUTUMN_KVCACHE_REV}" \
  && cd /tmp \
  && python3 -c 'import glob,zipfile,hashlib,os,autumn; \
     w=sorted(glob.glob("/src/python/target/wheels/autumn-*.whl"))[-1]; \
@@ -233,7 +241,7 @@ assert hasattr(b.AutumnKVCacheStorage, 'register_mem_host_pool_v2'), 'ABC defaul
 print('L3 adapter OK, interface from', b.HiCacheStorage.__module__)"
 
 # Trim the Rust toolchain and the build tree; ~1.5 GB and nothing at runtime
-# needs them. `/src/python/autumn_kvcache` stays — it is installed with -e.
+# needs them.
 RUN rm -rf /root/.rustup /root/.cargo/registry /src/target /src/python/target
 
 EXPOSE 1919
