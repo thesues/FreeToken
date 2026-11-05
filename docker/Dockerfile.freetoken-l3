@@ -53,7 +53,13 @@ ARG AUTUMN_IMAGE_PIN=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-r
 # time choice here exactly as it is for the production image.
 FROM ${AUTUMN_IMAGE_PIN} AS autumncore
 
-FROM ${FREETOKEN_IMAGE}
+# The pipeline still passes FREETOKEN_IMAGE=freetoken-autumn:9533ade8, a tag that
+# is gone from the registry (not found, 2026-11-05), and the CP API cannot edit
+# buildParams. Start from the last freetoken-l3 instead, under a name the
+# pipeline does not pass: every step below force-reinstalls freetoken and the
+# autumn client and removes its build output, so the result is the same.
+ARG FREETOKEN_BASE=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/freetoken-l3:640210dc400d96c48fff5418e591bed087ddb6a6
+FROM ${FREETOKEN_BASE}
 
 # ── Mirror knobs (override for China / air-gapped builds) ─────────────────────
 #   RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT : rustup TOOLCHAIN download mirror.
